@@ -54,18 +54,14 @@ def test_binary_also_refuses(monkeypatch):
 
 
 # -- and the behaviour it must not have broken -----------------------------
-def test_a_uniform_is_still_used_when_models_answer_badly(monkeypatch):
-    """Models replying with unusable prose is a different situation: forecast anyway."""
-    forecast = _run(q_numeric(), _responds_with_junk, monkeypatch)
-    assert "continuous_cdf" in forecast.payload
-    assert forecast.runs_used == 0
-    assert any("uniform" in n for n in forecast.notes)
-
-
-def test_multiple_choice_uniform_still_used_when_models_answer_badly(monkeypatch):
-    forecast = _run(q_mc(), _responds_with_junk, monkeypatch)
-    cat = forecast.payload["probability_yes_per_category"]
-    assert abs(sum(cat.values()) - 1.0) < 1e-6
+@pytest.mark.parametrize("factory", [q_numeric, q_mc], ids=["numeric", "multiple_choice"])
+def test_no_placeholder_either_when_models_answer_badly(factory, monkeypatch):
+    """Unusable prose used to become a uniform. A uniform scores far below the
+    zero of a question left alone, and it uses the question up, so the question
+    now stays open for the next poll, as a binary one always did."""
+    with pytest.raises(llm.LLMError) as err:
+        _run(factory(), _responds_with_junk, monkeypatch)
+    assert "nothing submitted" in str(err.value)
 
 
 def test_a_working_ensemble_is_unaffected(monkeypatch):

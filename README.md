@@ -78,8 +78,11 @@ scores zero. The constraints are exact: 201 values evenly spaced in unscaled
 space, every bucket mass between 0.00005 and 0.2, and the endpoints exactly 0
 and 1 when the corresponding bound is closed. This module contains a local copy
 of the server's validator, every CDF is checked against it before leaving the
-process, and anything that fails degrades to a legal uniform rather than being
-skipped. The fuzz tests throw 3,000 malformed model outputs at it.
+process, and a built distribution that fails degrades to a legal uniform rather
+than being skipped. The fuzz tests throw 3,000 malformed model outputs at it.
+When the models give no usable numbers at all, nothing is submitted and the
+question stays open for the next poll: a flat distribution scores well below
+the zero of a question left alone, and it would use the question up.
 
 The distribution is given explicit tails. Interpolating outward from the
 outermost elicited percentile extrapolates the steep middle slope, which

@@ -85,8 +85,10 @@ def test_a_legal_distribution_passes():
     assert monitor.check_payload({"continuous_cdf": cdf}, q) == []
 
 
-def test_a_comment_without_reasoning_is_flagged():
-    assert "comment carries no reasoning" in monitor.check_comment("x" * 300 + "Forecast: 20%\n(not captured)")
+def test_a_comment_without_reasoning_is_flagged_but_never_holds_a_forecast_back():
+    problems = monitor.check_comment("x" * 300 + "Forecast: 20%\n(not captured)")
+    assert "comment carries no reasoning" in problems
+    assert not monitor.is_rejectable(problems)
     assert monitor.check_comment("Reasoning. " * 40 + "Forecast: 20%") == []
 
 

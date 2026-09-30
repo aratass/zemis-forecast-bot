@@ -206,8 +206,8 @@ def test_comment_records_models_sources_and_calibration(fake_llm):
     assert "Forecast:" in forecast.comment
 
 
-def test_a_model_that_says_nothing_useful_does_not_sink_the_question(monkeypatch, fake_llm):
-    """Numeric falls back to a legal uniform rather than skipping the question."""
+def test_a_model_that_says_nothing_useful_leaves_the_question_open(monkeypatch, fake_llm):
+    """No uniform placeholder: it would score worse than no forecast at all."""
     state, _ = fake_llm
 
     def useless(messages, models, **kwargs):
@@ -219,17 +219,15 @@ def test_a_model_that_says_nothing_useful_does_not_sink_the_question(monkeypatch
     monkeypatch.setattr(fc, "chat_with_fallback", useless)
     question = q_numeric()
     state["kind"] = "numeric"
-    forecast = fc.forecast_question(
-        post=POST,
-        question=question,
-        research_text="",
-        research_sources=[],
-        models=["a/one"],
-        runs=3,
-    )
-    assert_payload_ok(forecast, question)
-    assert forecast.runs_used == 0
-    assert any("uniform" in n for n in forecast.notes)
+    with pytest.raises(fc.LLMError):
+        fc.forecast_question(
+            post=POST,
+            question=question,
+            research_text="",
+            research_sources=[],
+            models=["a/one"],
+            runs=3,
+        )
 
 
 def test_binary_with_no_usable_output_raises_rather_than_guessing(monkeypatch, fake_llm):

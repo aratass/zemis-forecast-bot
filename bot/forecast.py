@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Sequence
 
 from . import aggregate, config, parsing, prompts
-from .cdf import DEFAULT_INBOUND_OUTCOME_COUNT, build_cdf, percentiles_from_cdf, safe_cdf
+from .cdf import DEFAULT_INBOUND_OUTCOME_COUNT, build_cdf, percentiles_from_cdf
 from .llm import (
     FALLBACK_ONLY,
     cooling_down,
@@ -451,16 +451,11 @@ def forecast_numeric(ctx: dict, research: str, models: Sequence[str], runs: int)
     parsed_runs = [points for points, _, _ in parsed]
     used = [m for _, _, m in parsed]
     if not parsed_runs:
-        notes.append("models responded but no usable percentiles; submitting a uniform distribution")
-        cdf = safe_cdf(count, ctx["open_lower_bound"], ctx["open_upper_bound"])
-        return (
-            {"question": ctx["question_id"], "continuous_cdf": cdf},
-            "uniform (no usable model output)",
-            notes,
-            0,
-            used,
-            "",
-        )
+        # A flat distribution is not a forecast. Against a field of bots it
+        # scores far below the zero a question without a forecast scores, and
+        # it uses the question up. Leave it open for the next poll instead,
+        # the same rule the binary path has always followed.
+        raise LLMError("models answered but gave no usable percentiles; nothing submitted")
 
     merged = aggregate.aggregate_percentiles(parsed_runs)
     widened = aggregate.extend_tails(aggregate.widen_percentiles(merged))
@@ -532,8 +527,9 @@ def forecast_multiple_choice(ctx: dict, research: str, models: Sequence[str], ru
     used = [m for _, _, m in parsed]
     merged = aggregate.aggregate_multiple_choice(parsed_runs, options)
     if merged is None:
-        notes.append("models responded but no usable option probabilities; using the uniform")
-        merged = {o: 1.0 / len(options) for o in options}
+        # Same reasoning as the numeric path: a uniform is a placeholder, and
+        # a placeholder scores worse than no forecast.
+        raise LLMError("models answered but gave no usable option probabilities; nothing submitted")
     final = aggregate.calibrate_multiple_choice(merged, options)
     top = max(final, key=lambda o: final[o])
     notes.append(f"{len(parsed_runs)} usable runs; top option {top} at {final[top]:.1%}")

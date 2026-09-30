@@ -64,8 +64,15 @@ def check_payload(payload: dict, question: dict) -> list[str]:
 
 
 def is_rejectable(problems: list[str]) -> bool:
-    """Problems the server rejects outright, so there is no point sending it."""
-    return any(not p.startswith("binary forecast at exactly 50%") for p in problems)
+    """Problems the server rejects outright, so there is no point sending it.
+
+    Comment problems are reported but never hold a forecast back: a forecast
+    with a thin comment still scores, and one not sent scores zero.
+    """
+    return any(
+        not p.startswith("binary forecast at exactly 50%") and not p.startswith("comment ")
+        for p in problems
+    )
 
 
 def check_comment(comment: str) -> list[str]:
