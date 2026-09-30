@@ -294,11 +294,15 @@ def test_each_run_is_led_by_a_different_flash_version_and_stand_ins_come_last(mo
 
     def record(messages, models, **kwargs):
         orders.append(list(models))
-        return REPLIES["binary"], models[0]
+        if STAND_IN not in models:
+            raise llm.LLMError("HTTP 503 overloaded")
+        return REPLIES["binary"], STAND_IN
 
     _forecast(_question(q_binary, 10), monkeypatch, record)
-    assert sorted(o[0] for o in orders) == sorted(FLASH)
-    assert all(o[-1] == STAND_IN for o in orders), orders
+    strong_calls = [o for o in orders if STAND_IN not in o]
+    assert sorted(o[0] for o in strong_calls) == sorted(FLASH)
+    assert all(set(o) <= set(FLASH) for o in strong_calls), "no stand-in inside a strong call"
+    assert [o for o in orders if STAND_IN in o] == [[STAND_IN]] * 4, "each run falls back only after its strong call"
 
 
 def test_while_there_is_time_stand_ins_are_not_even_asked(monkeypatch):
@@ -344,7 +348,8 @@ def test_at_the_deadline_the_stand_in_is_used_rather_than_nothing(monkeypatch):
     llm.FALLBACK_ONLY.add(STAND_IN)
 
     def only_stand_in(messages, models, **kwargs):
-        assert models[-1] == STAND_IN
+        if STAND_IN not in models:
+            raise llm.LLMError("HTTP 503 overloaded")
         return REPLIES["binary"], STAND_IN
 
     forecast = _forecast(_question(q_binary, 10), monkeypatch, only_stand_in)
@@ -383,16 +388,62 @@ def test_with_enough_strong_answers_the_stand_ins_are_left_out(monkeypatch):
     assert forecast.payload["probability_yes"] < 0.3
 
 
-def test_when_no_strong_model_can_answer_the_question_waits(monkeypatch):
+def test_when_the_strong_models_return_before_the_deadline_the_question_waits(monkeypatch):
     llm.FALLBACK_ONLY.add(STAND_IN)
     for m in FLASH:
-        llm.EXHAUSTED_UNTIL[m] = datetime.now(timezone.utc).timestamp() + 3600
+        llm.EXHAUSTED_UNTIL[m] = datetime.now(timezone.utc).timestamp() + 20 * 60
 
     def nobody(messages, models, **kwargs):
         raise llm.NoModelsAvailable("all out for the day")
 
     with pytest.raises(EnsembleTooThin):
         _forecast(_question(q_numeric, 80), monkeypatch, nobody)
+
+
+def test_when_the_strong_models_are_out_until_after_the_deadline_the_stand_in_goes_now(monkeypatch):
+    """30 September: every Flash allowance was used up by 22:40 UTC until 07:00."""
+    llm.FALLBACK_ONLY.add(STAND_IN)
+    for m in FLASH:
+        llm.EXHAUSTED_UNTIL[m] = datetime.now(timezone.utc).timestamp() + 8 * 3600
+    asked = []
+
+    def stand_in(messages, models, **kwargs):
+        asked.append(list(models))
+        return REPLIES["binary"], STAND_IN
+
+    forecast = _forecast(_question(q_binary, 80), monkeypatch, stand_in)
+    assert forecast.models_used == [STAND_IN]
+    assert all(STAND_IN in o for o in asked)
+
+
+def test_at_the_deadline_a_model_that_just_refused_is_skipped_and_calls_are_short(monkeypatch):
+    llm.FALLBACK_ONLY.add(STAND_IN)
+    for m in FLASH:
+        llm._COOLDOWN_UNTIL[m] = llm.time.monotonic() + 60
+    seen = []
+
+    def record(messages, models, **kwargs):
+        seen.append((list(models), kwargs.get("attempts"), kwargs.get("timeout")))
+        return REPLIES["binary"], models[0]
+
+    _forecast(_question(q_binary, 10), monkeypatch, record)
+    assert [order for order, _, _ in seen] == [[STAND_IN]] * 2, "Flash skipped; two stand-in runs"
+
+
+def test_at_the_deadline_strong_calls_are_short_and_single(monkeypatch):
+    llm.FALLBACK_ONLY.add(STAND_IN)
+    seen = []
+
+    def record(messages, models, **kwargs):
+        seen.append((list(models), kwargs.get("attempts"), kwargs.get("timeout")))
+        if STAND_IN in models:
+            return REPLIES["binary"], STAND_IN
+        raise llm.LLMError("HTTP 503 overloaded")
+
+    _forecast(_question(q_binary, 10), monkeypatch, record)
+    strong = [(a, t) for o, a, t in seen if STAND_IN not in o]
+    assert strong and all(a == 1 and t <= 120 for a, t in strong), seen
+    assert all(a == 2 for o, a, t in seen if STAND_IN in o), "the stand-in keeps its retries"
 
 
 @pytest.mark.parametrize("factory", [q_binary, q_numeric, q_mc], ids=["binary", "numeric", "mc"])

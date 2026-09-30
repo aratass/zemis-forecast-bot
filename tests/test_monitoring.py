@@ -406,3 +406,38 @@ def test_latest_comments_name_the_models_and_the_forecast():
 
     (line,) = audit.latest_comments(C(), 7)
     assert line.startswith("09-30 21:10 post 45999: 23.0%; models gemini/models/gemini-3.6-flash;")
+
+
+def test_the_last_dry_run_poll_takes_waiting_questions_through_the_deadline(monkeypatch, quiet_research):
+    from bot import config
+
+    posts = {"bot-testing-area": [_open_post(1, q_binary())]}
+
+    class FakeMetaculus(Client):
+        def __init__(self, dry_run=False):
+            super().__init__(posts, dry_run=dry_run)
+
+    seen_force = []
+
+    def forecast_question(post, question, **kwargs):
+        seen_force.append(fc.FORCE_DEADLINE)
+        if not fc.FORCE_DEADLINE:
+            raise EnsembleTooThin("0 of 2 strong answers so far")
+        return fc.Forecast(question["id"], post["id"], "binary", {"question": question["id"], "probability_yes": 0.3},
+                           "Reasoning. " * 30 + "Forecast: 30%", "30%", models_used=["groq/x"])
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(runner.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(runner.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s))
+    monkeypatch.setenv("BOT_AUDIT", "off")
+    monkeypatch.setattr(runner, "MetaculusClient", FakeMetaculus)
+    monkeypatch.setattr(runner, "resolve_models", lambda n: ["gemini/x"])
+    monkeypatch.setattr(runner, "probe", lambda models: {})
+    monkeypatch.setattr(runner, "catalogue_report", lambda: [])
+    monkeypatch.setattr(runner, "forecast_question", forecast_question)
+    monkeypatch.setattr(config, "DRY_RUN_PATIENCE_SECONDS", 400)
+    monkeypatch.setattr(config, "DRY_RUN_INTERVAL_SECONDS", 150)
+    runner.main(["--mode", "test", "--dry-run"])
+    assert seen_force[-1] is True and seen_force[0] is False
+    assert [r.question_id for r in runner.TALLY.forecasts] == [101]
+    assert not runner.TALLY.waiting

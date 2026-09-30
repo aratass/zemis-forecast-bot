@@ -100,7 +100,9 @@ STATIC_FALLBACK = ["openai/gpt-5", "anthropic/claude-sonnet-4", "google/gemini-2
 PROVIDER_LIMITS: dict[str, tuple[float, int]] = {
     "openrouter": (120.0, 6),
     "gemini": (10.0, 2),
-    "groq": (25.0, 3),
+    # Groq's free gpt-oss-120b allows about 8,000 tokens a minute, and one
+    # high-effort answer runs to several thousand, so calls are spaced out.
+    "groq": (6.0, 2),
     "metaculus": (20.0, 2),
 }
 
@@ -262,6 +264,12 @@ _COOLDOWN_UNTIL: dict[str, float] = {}
 _PROMPT_TOO_LONG = re.compile(
     r"(tokens_limit_reached|too large|too long|maximum context|context length)", re.I
 )
+
+
+def cooling_down() -> set[str]:
+    """Models that refused (429, 503, unreadable) within the last minute."""
+    mono = time.monotonic()
+    return {m for m, until in list(_COOLDOWN_UNTIL.items()) if until > mono}
 
 
 def model_available(model: str, now: float | None = None) -> bool:

@@ -63,6 +63,11 @@ DEFER_MARGIN_MINUTES = _int_env("DEFER_MARGIN_MINUTES", 30)
 # next Flash version.
 ENSEMBLE_ATTEMPTS = _int_env("ENSEMBLE_ATTEMPTS", 2)
 
+# Runs per question when only stand-ins can answer. Groq's free gpt-oss-120b
+# allows about 8,000 tokens a minute, and one high-effort answer is close to
+# that, so two runs per question keeps a burst of questions inside it.
+STAND_IN_RUNS = _int_env("STAND_IN_RUNS", 2)
+
 # A dry run only reads and reasons, but it spends the same free allowances as a
 # live run, so it looks at a handful of questions, not the whole tournament.
 DRY_RUN_LIMIT = _int_env("DRY_RUN_LIMIT", 6)

@@ -22,6 +22,7 @@ import traceback
 from datetime import datetime, timezone
 
 from . import config, report, research as research_mod
+from . import forecast as forecast_mod
 from .audit import latest_comments, run_audit
 from .client import (
     MetaculusClient,
@@ -48,6 +49,7 @@ from .llm import (
     NoModelsAvailable,
     catalogue_report,
     failure_summary,
+    model_available,
     metaculus_proxy_models,
     probe,
     provider_is_metered,
@@ -462,8 +464,15 @@ def main(argv: list[str] | None = None) -> int:
         deadline = time.monotonic() + config.DRY_RUN_PATIENCE_SECONDS
         interval = config.DRY_RUN_INTERVAL_SECONDS
     total = 0
+    final_dry_poll = False
     while True:
         started = time.monotonic()
+        if final_dry_poll:
+            # The last poll of a dry run takes every question still waiting
+            # through the deadline path, so each type is carried to a checked
+            # payload and comment even when the strong models are out.
+            forecast_mod.FORCE_DEADLINE = True
+            log.info("last dry-run poll: questions still waiting go through the deadline path")
         try:
             total += run_tick(
                 client,
@@ -479,11 +488,20 @@ def main(argv: list[str] | None = None) -> int:
             log.error("tick crashed:\n%s", trace[:2000])
             report.annotate("error", "tick crashed", trace[-1500:], reserve=1)
 
-        if deadline is None:
+        if deadline is None or final_dry_poll:
             break
         if args.dry_run and not args.watch and not TALLY.waiting:
             break
         remaining = deadline - time.monotonic()
+        strong_back = any(model_available(m, time.time() + remaining) for m in strong)
+        if args.dry_run and not args.watch and (remaining <= interval or not strong_back):
+            # Out of patience, or every strong model is out for the day
+            # beyond it: waiting longer cannot change what the dry run sees.
+            final_dry_poll = True
+            nap = max(30.0, min(interval - (time.monotonic() - started), max(remaining, 0.0)))
+            log.info("sleeping %.0fs before the last dry-run poll", nap)
+            time.sleep(nap)
+            continue
         if remaining <= 0:
             break
         nap = max(30.0, min(interval - (time.monotonic() - started), remaining))

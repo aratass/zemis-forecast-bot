@@ -159,10 +159,13 @@ to the job summary on the run page:
 
 - **self-audit**, first: from the server's side, how many questions the bot
   has forecast in each scored tournament, how many resolved, the summed spot
-  peer, peer and baseline scores on those, its leaderboard rank, and whether
-  any forecast question lacks its comment, was forecast twice, sits at exactly
-  50 percent, or has a malformed distribution. It only reads; `BOT_AUDIT=off`
-  skips it.
+  peer, peer and baseline scores on those, its leaderboard rank, which closed
+  questions it never forecast, and whether any forecast question lacks its
+  comment, was forecast twice, sits at exactly 50 percent, or has a malformed
+  distribution, each with the time it happened. Then its newest comments,
+  with the forecast and the models each names: the quickest outside check
+  that the live pipeline works. It only reads; `BOT_AUDIT=off` skips it. The
+  check-sources workflow runs it too, at no model cost.
 - **ensemble**: the strong models, the stand-ins, which keys are present (by
   name), and in a dry run a one-line probe of every model.
 - **one note per forecast**, until the per-step budget of ten runs out: the

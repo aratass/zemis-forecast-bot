@@ -17,6 +17,7 @@ from . import aggregate, config, parsing, prompts
 from .cdf import DEFAULT_INBOUND_OUTCOME_COUNT, build_cdf, percentiles_from_cdf, safe_cdf
 from .llm import (
     FALLBACK_ONLY,
+    cooling_down,
     LLMError,
     NoModelsAvailable,
     chat_with_fallback,
@@ -180,20 +181,37 @@ def search_queries(ctx: dict, models: Sequence[str]) -> list[str]:
 
 
 # -- per-type pipelines ----------------------------------------------------
-def can_defer(ctx: dict, now: datetime | None = None) -> bool:
+# Set by the runner for the last poll of a dry run, so that questions still
+# waiting are carried through the deadline path and every type gets checked.
+FORCE_DEADLINE = False
+
+
+def can_defer(ctx: dict, models: Sequence[str] = (), now: datetime | None = None) -> bool:
     """May this question wait for the next poll?
 
     Only when the ensemble has stand-ins behind its strong models (otherwise
-    there is nothing better to wait for), and only while the question stays
-    open for longer than the safety margin.
+    there is nothing better to wait for), only while the question stays open
+    for longer than the safety margin, and only if some strong model can
+    answer before that margin. When every strong model is out of its daily
+    allowance until after the question closes, waiting wins nothing and
+    spends the stand-in's time: on 30 September all four Flash allowances
+    were used up by 22:40 UTC and came back at 07:00.
     """
-    if not FALLBACK_ONLY:
+    if not FALLBACK_ONLY or FORCE_DEADLINE:
         return False
     close = ctx.get("close_dt")
     if close is None:
         return False
     now = now or datetime.now(timezone.utc)
-    return (close - now).total_seconds() > config.DEFER_MARGIN_MINUTES * 60
+    margin = config.DEFER_MARGIN_MINUTES * 60
+    if (close - now).total_seconds() <= margin:
+        return False
+    primaries = [m for m in models if m not in FALLBACK_ONLY]
+    if primaries:
+        last_useful = close.timestamp() - margin
+        if not any(model_available(m, last_useful) for m in primaries):
+            return False
+    return True
 
 
 def _run_ensemble(
@@ -219,16 +237,47 @@ def _run_ensemble(
         primaries, fallbacks = list(models), []
     tail = fallbacks if allow_fallback else []
 
-    cached = list(_STRONG_ANSWERS.get(cache_key, [])) if cache_key else []
-    tasks = []
-    for i in range(len(cached), runs):
-        k = i % len(primaries)
-        ordered = primaries[k:] + primaries[:k] + tail
-        tasks.append(
-            lambda o=ordered: chat_with_fallback(
-                messages, o, temperature=temperature, attempts=config.ENSEMBLE_ATTEMPTS
+    strong_attempts, strong_timeout = config.ENSEMBLE_ATTEMPTS, 240.0
+    wanted = runs
+    if tail:
+        # At the deadline the stand-in must get its turn in time. A strong
+        # model that refused within the last minute or is out for the day is
+        # skipped, and the rest get one short try each, so four overloaded
+        # Flash models cannot use up the last half hour. The stand-in keeps
+        # its normal retries: Groq's free gpt-oss-120b allows about 8,000
+        # tokens a minute, so a burst of calls meets per-minute refusals.
+        cool = cooling_down()
+        primaries = [m for m in primaries if m not in cool and model_available(m)]
+        strong_attempts, strong_timeout = 1, 120.0
+        if not primaries:
+            # Only stand-ins can answer. Fewer runs, so that a burst of
+            # questions at the deadline stays inside the stand-in's limits.
+            wanted = min(runs, config.STAND_IN_RUNS)
+
+    def make_task(k: int):
+        strong = primaries[k:] + primaries[:k] if primaries else []
+
+        def task():
+            if strong:
+                try:
+                    return chat_with_fallback(
+                        messages,
+                        strong,
+                        temperature=temperature,
+                        attempts=strong_attempts,
+                        timeout=strong_timeout,
+                    )
+                except LLMError:
+                    if not tail:
+                        raise
+            return chat_with_fallback(
+                messages, tail, temperature=temperature, attempts=config.ENSEMBLE_ATTEMPTS
             )
-        )
+
+        return task
+
+    cached = list(_STRONG_ANSWERS.get(cache_key, [])) if cache_key else []
+    tasks = [make_task(i % len(primaries) if primaries else 0) for i in range(len(cached), wanted)]
     out: list[tuple[str, str]] = []
     dead = 0
     for result in run_parallel(tasks, workers=min(max(len(tasks), 1), 5)):
@@ -316,7 +365,7 @@ def _reasoning_excerpt(text: str, limit: int = COMMENT_REASONING_CHARS) -> str:
 
 
 def forecast_binary(ctx: dict, research: str, models: Sequence[str], runs: int):
-    deferrable = can_defer(ctx)
+    deferrable = can_defer(ctx, models)
     results = _run_ensemble(
         prompts.binary_prompt(ctx, research),
         models,
@@ -363,7 +412,7 @@ def forecast_binary(ctx: dict, research: str, models: Sequence[str], runs: int):
 
 def forecast_numeric(ctx: dict, research: str, models: Sequence[str], runs: int):
     is_date = ctx["type"] == "date"
-    deferrable = can_defer(ctx)
+    deferrable = can_defer(ctx, models)
     results = _run_ensemble(
         prompts.numeric_prompt(ctx, research),
         models,
@@ -455,7 +504,7 @@ def _looks_like_epoch(v: Any) -> bool:
 
 def forecast_multiple_choice(ctx: dict, research: str, models: Sequence[str], runs: int):
     options = ctx["options"]
-    deferrable = can_defer(ctx)
+    deferrable = can_defer(ctx, models)
     results = _run_ensemble(
         prompts.multiple_choice_prompt(ctx, research),
         models,

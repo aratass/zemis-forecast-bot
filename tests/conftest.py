@@ -55,6 +55,7 @@ def fresh_model_state():
         llm.PRIMARY_PROVIDER = None
         llm.FAILURES.clear()
         forecast._STRONG_ANSWERS.clear()
+        forecast.FORCE_DEADLINE = False
 
     clear()
     yield
