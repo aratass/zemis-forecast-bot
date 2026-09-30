@@ -228,9 +228,10 @@ def _q(qid, qtype="binary", n=1, values=None, status="open", resolution=None, sc
 
 
 class AuditClient:
-    def __init__(self, forecast_posts, commented_ids, open_posts, board=None):
+    def __init__(self, forecast_posts, commented_ids, open_posts, board=None, missed_posts=()):
         self.forecast_posts, self.commented_ids, self.open_posts, self.board = (
             forecast_posts, commented_ids, open_posts, board)
+        self.missed_posts = list(missed_posts)
         self.calls = []
 
     def me(self):
@@ -243,6 +244,8 @@ class AuditClient:
             return list(self.forecast_posts)
         if "commented_by" in extra:
             return [p for p in self.forecast_posts if p["id"] in self.commented_ids]
+        if "not_forecaster_id" in extra:
+            return list(self.missed_posts)
         return list(self.open_posts)
 
     def project_leaderboard(self, project_id):
@@ -266,7 +269,10 @@ def test_the_audit_counts_and_flags_what_the_rules_care_about():
     open_posts = [{"id": 9, "question": _q(19, n=0)}]
     board = [{"entries": [{"rank": 1}, {"rank": 2}, {"rank": 3}],
               "userEntry": {"rank": 2, "score": 12.5, "prize": 0}}]
-    client = AuditClient(posts, commented_ids={1, 3, 4}, open_posts=open_posts, board=board)
+    missed = [{"id": 8, "question": {"id": 18, "type": "binary", "status": "closed", "title": "missed one",
+                                     "open_time": "2026-09-29T10:00:00Z", "scheduled_close_time": "2026-09-29T11:30:00Z"}},
+              {"id": 6, "question": {"id": 16, "type": "binary", "status": "resolved", "resolution": "annulled"}}]
+    client = AuditClient(posts, commented_ids={1, 3, 4}, open_posts=open_posts, board=board, missed_posts=missed)
     me, (result,) = audit.run_audit(client, ["fall-futureeval-2026"])
     assert me["username"] == "zemis-bot"
     assert result.questions_forecast == 4
@@ -278,6 +284,8 @@ def test_the_audit_counts_and_flags_what_the_rules_care_about():
     assert result.malformed == []
     assert result.open_unforecast == [19]
     assert (result.rank, result.ranked_entries) == (2, 3)
+    assert result.missed == [18], "an annulled question is not a miss"
+    assert any("missed q18: open 09-29 10:00 to 09-29 11:30 UTC" in d for d in result.details)
     assert not result.clean
     line = result.line()
     assert "rank 2 of 3" in line and "comments missing on 1 post(s) [2]" in line

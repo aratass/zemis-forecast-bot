@@ -51,6 +51,9 @@ class TournamentAudit:
     at_fifty: list[int] = field(default_factory=list)
     malformed: list[int] = field(default_factory=list)
     open_unforecast: list[int] = field(default_factory=list)
+    # Closed or resolved questions the bot never forecast. Each one scored
+    # zero, which under a squared prize rule is the most expensive outcome.
+    missed: list[int] = field(default_factory=list)
     project_id: int | None = None
     rank: int | None = None
     ranked_entries: int | None = None
@@ -102,6 +105,10 @@ class TournamentAudit:
         parts.append(
             "malformed forecasts: " + (f"{len(self.malformed)} {self.malformed[:10]}" if self.malformed else "0")
         )
+        parts.append(
+            "closed without a forecast from the bot: "
+            + (f"{len(self.missed)} {self.missed[:10]}" if self.missed else "0")
+        )
         if self.open_unforecast:
             parts.append(f"open and not yet forecast: {self.open_unforecast[:10]}")
         if self.errors:
@@ -125,6 +132,13 @@ def _when(epoch: Any) -> str:
     try:
         return datetime.fromtimestamp(float(epoch), timezone.utc).strftime("%m-%d %H:%M")
     except (TypeError, ValueError, OverflowError, OSError):
+        return "?"
+
+
+def _when_iso(value: Any) -> str:
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).strftime("%m-%d %H:%M")
+    except (TypeError, ValueError):
         return "?"
 
 
@@ -220,6 +234,29 @@ def audit_tournament(client: MetaculusClient, slug: str, me_id: int) -> Tourname
     except MetaculusError as exc:
         audit.errors.append(str(exc)[:200])
         return audit
+    try:
+        unforecast_closed = list(
+            client.iter_posts(
+                slug,
+                statuses=["closed", "resolved"],
+                extra=[("not_forecaster_id", me_id)],
+                include_descriptions=False,
+            )
+        )
+    except MetaculusError as exc:
+        audit.errors.append(f"missed questions: {str(exc)[:160]}")
+        unforecast_closed = []
+    for post in unforecast_closed:
+        for question in sub_questions(post):
+            if str(question.get("resolution")) in UNSCORED:
+                continue
+            audit.missed.append(question.get("id"))
+            if len(audit.details) < 30:
+                audit.details.append(
+                    f"missed q{question.get('id')}: open {_when_iso(question.get('open_time'))} to "
+                    f"{_when_iso(question.get('actual_close_time') or question.get('scheduled_close_time'))} UTC: "
+                    f"{(question.get('title') or post.get('title') or '')[:60]}"
+                )
 
     projects: Counter = Counter()
     for post in forecast_posts:
