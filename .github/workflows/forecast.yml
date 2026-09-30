@@ -79,8 +79,24 @@ jobs:
           else
             echo "::warning::WATCHER_PAT is set but cannot read this repository's runs. It probably needs Actions: read and write."
           fi
+      - name: self-audit
+        # Its own step so that its annotations (the bot's record, and the
+        # models this watcher will use) are readable a minute after start,
+        # not when the five-hour forecast step ends. Reads only; never blocks.
+        continue-on-error: true
+        timeout-minutes: 5
+        env:
+          METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
+          ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
+        run: python -m bot.runner --audit-only --mode "${{ inputs.mode || 'tournament' }}"
       - name: forecast
         env:
+          # The step above has written the self-audit already.
+          BOT_AUDIT: "off"
           METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}

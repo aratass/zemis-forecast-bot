@@ -470,3 +470,20 @@ def test_every_prompt_asks_for_the_reasoning_in_the_open(factory):
     user = builder(ctx, "evidence")[-1]["content"]
     assert "published with the forecast as its explanation" in user
     assert user.index("published with the forecast") < user.rindex("Finish with exactly")
+
+
+def test_audit_only_writes_the_audit_and_the_ensemble_and_forecasts_nothing(monkeypatch, actions, capsys):
+    audited = []
+
+    class FakeMetaculus(Client):
+        def __init__(self, dry_run=False):
+            super().__init__({}, dry_run=dry_run)
+
+    monkeypatch.setattr(runner, "MetaculusClient", FakeMetaculus)
+    monkeypatch.setattr(runner, "_self_audit", lambda client: audited.append(True))
+    monkeypatch.setattr(runner, "resolve_models", lambda n: (llm.FALLBACK_ONLY.add(STAND_IN) or FLASH + [STAND_IN]))
+    monkeypatch.setattr(runner, "run_tick", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no forecasting")))
+    assert runner.main(["--audit-only"]) == 0
+    assert audited == [True]
+    (line,) = [c for c in _commands(capsys.readouterr().out) if "ensemble at start" in c]
+    assert "gemini-3.8-flash" in line and "gpt-oss-120b" in line

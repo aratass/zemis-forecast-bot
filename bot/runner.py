@@ -397,6 +397,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--interval", type=int, default=300, help="seconds between polls in watch mode")
     parser.add_argument("--dry-run", action="store_true", help="do everything except submit")
     parser.add_argument("--check-sources", action="store_true")
+    parser.add_argument(
+        "--audit-only",
+        action="store_true",
+        help="write the self-audit and the resolved ensemble, forecast nothing",
+    )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args(argv)
 
@@ -416,6 +421,17 @@ def main(argv: list[str] | None = None) -> int:
     _self_audit(client)
 
     models = resolve_models(config.ENSEMBLE_MODELS)
+    if args.audit_only:
+        # Its own workflow step, so its annotations appear a minute after a
+        # watcher starts instead of when the five-hour step ends.
+        strong = [m for m in models if m not in FALLBACK_ONLY]
+        lines = [
+            f"strong models: {', '.join(strong) or 'none'}",
+            f"stand-ins (near the deadline only): {', '.join(m for m in models if m in FALLBACK_ONLY) or 'none'}",
+            f"keys present: {', '.join(_keys_present()) or 'none'}",
+        ]
+        report.annotate("notice", "ensemble at start", "\n".join(lines))
+        return 0
     runs = args.runs
     if provider_is_metered() and runs == config.RUNS_PER_QUESTION:
         runs = config.RUNS_PER_QUESTION_METERED if FALLBACK_ONLY else config.RUNS_PER_QUESTION_UNTIERED
