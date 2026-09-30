@@ -247,6 +247,7 @@ DEAD_MODELS: set[str] = set()
 # day (TPD)") and hands back a Retry-After of an hour or more.
 _DAILY_LIMIT = re.compile(r"(PerDay|per day|\(RPD\)|\(TPD\))", re.I)
 LONG_RETRY_SECONDS = 600.0
+GEMINI_DAILY_BACKOFF_SECONDS = float(os.environ.get("GEMINI_DAILY_BACKOFF_SECONDS") or 1800)
 RATE_LIMIT_MAX_SLEEP = 20.0
 
 # Models whose daily allowance is used up, and the wall-clock time it returns.
@@ -509,7 +510,12 @@ def chat(
             ):
                 # Out for the day. Retrying before the reset only burns time.
                 if prov.name == "gemini":
-                    until = _next_pacific_midnight()
+                    # Google documents a reset at midnight Pacific, but on 30
+                    # September a Flash model refused as "used up for the
+                    # day" at 22:58 UTC answered again at 23:05. A refusal
+                    # costs nothing, so look again after a while rather than
+                    # writing the model off until the documented reset.
+                    until = min(_next_pacific_midnight(), time.time() + GEMINI_DAILY_BACKOFF_SECONDS)
                 else:
                     until = time.time() + (delay or 3600.0)
                 EXHAUSTED_UNTIL[model] = until
@@ -668,7 +674,9 @@ def probe(models: Sequence[str]) -> dict[str, str]:
             text = chat(
                 [{"role": "user", "content": "Reply with the word OK and nothing else."}],
                 model,
-                max_tokens=64,
+                # Gemini 3 thinks even when not asked to, and 64 tokens of
+                # thinking left the probe with nothing to say.
+                max_tokens=1024,
                 attempts=1,
                 reasoning=False,
             )

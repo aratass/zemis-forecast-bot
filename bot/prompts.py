@@ -46,6 +46,14 @@ _GUARDS = """Two things about how this question works, which are the most expens
 * A question of the form "will X happen before <date>" covers the whole window from now until that date. It has not resolved No merely because X has not happened yet, and it has not resolved Yes merely because something resembling X happened before the question opened."""
 
 
+# The rules ask for comments "so everyone can see their reasoning", and the
+# comment quotes the model's answer. A reasoning model that thinks in private
+# and then obeys "finish with exactly this line" answers with the line alone:
+# the third dry run's Gemini comment read, in full, "PROBABILITY: 2%". So the
+# reasoning is asked for in the open, briefly.
+_SHOW_WORK = """Write your reasoning for these steps as short plain text before the final block: a few sentences for each step, naming the base rate and the evidence you relied on. It is published with the forecast as its explanation."""
+
+
 # Looking up related markets is the single strongest free signal in the
 # published surveys: 34% of winners did it against 0% of non-winners (p = 0.04),
 # and it ranked second of 33 features the following season (r = +0.34).
@@ -96,6 +104,8 @@ def binary_prompt(ctx: dict, research: str) -> list[dict]:
 
 {_GUARDS}
 
+{_SHOW_WORK}
+
 Finish with exactly this line and nothing after it:
 PROBABILITY: X%
 
@@ -126,6 +136,8 @@ Units: {unit or 'as stated in the question'}
 (f) What an unexpectedly low outcome would look like, and an unexpectedly high one. Real distributions have fatter tails than they feel like they should.
 
 {_GUARDS}
+
+{_SHOW_WORK}
 
 Then give your distribution as percentiles. Use plain numbers in the question's units, with no commas, currency symbols, percent signs or words. Report the value on the scale the units state: if the unit is millions, answer in millions, not in ones. A bot maker lost eighty peer points on a single question to that one mistake.
 
@@ -159,6 +171,8 @@ The options are:
 {_GUARDS}
 
 Leave real probability on options that look unlikely but are not impossible. Do not let any option fall below 1 percent unless it is genuinely ruled out by the resolution criteria.
+
+{_SHOW_WORK}
 
 Finish with exactly this block, one line per option, using the option text exactly as written above, and nothing after it:
 PROBABILITIES:

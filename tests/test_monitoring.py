@@ -441,3 +441,32 @@ def test_the_last_dry_run_poll_takes_waiting_questions_through_the_deadline(monk
     assert seen_force[-1] is True and seen_force[0] is False
     assert [r.question_id for r in runner.TALLY.forecasts] == [101]
     assert not runner.TALLY.waiting
+
+
+def test_a_gemini_daily_refusal_is_looked_at_again_within_half_an_hour(monkeypatch):
+    class R:
+        status_code = 429
+        text = ('[{"error": {"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "quota", "details": '
+                '[{"violations": [{"quotaId": "GenerateRequestsPerDayPerProjectPerModel-FreeTier", "quotaValue": "20"}]}]}}]')
+        headers = {}
+        ok = False
+
+    monkeypatch.setattr(llm.requests, "post", lambda *a, **k: R())
+    monkeypatch.setattr(llm.LIMITER, "wait", lambda key: None)
+    monkeypatch.setenv("GEMINI_API_KEY", "g")
+    with pytest.raises(llm.ModelUnavailable):
+        llm.chat([{"role": "user", "content": "x"}], FLASH[0])
+    wait = llm.EXHAUSTED_UNTIL[FLASH[0]] - llm.time.time()
+    assert 0 < wait <= llm.GEMINI_DAILY_BACKOFF_SECONDS + 1
+
+
+@pytest.mark.parametrize("factory", [q_binary, q_numeric, q_mc], ids=["binary", "numeric", "mc"])
+def test_every_prompt_asks_for_the_reasoning_in_the_open(factory):
+    from bot import prompts
+
+    ctx = fc.build_context(POST, factory())
+    builder = {"binary": prompts.binary_prompt, "numeric": prompts.numeric_prompt,
+               "multiple_choice": prompts.multiple_choice_prompt}[ctx["type"]]
+    user = builder(ctx, "evidence")[-1]["content"]
+    assert "published with the forecast as its explanation" in user
+    assert user.index("published with the forecast") < user.rindex("Finish with exactly")
