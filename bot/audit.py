@@ -20,6 +20,7 @@ failure anywhere in it is reported and never stops the run.
 from __future__ import annotations
 
 import logging
+import re
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -321,6 +322,31 @@ def audit_tournament(client: MetaculusClient, slug: str, me_id: int) -> Tourname
         except MetaculusError as exc:
             audit.errors.append(f"leaderboard: {str(exc)[:160]}")
     return audit
+
+
+_MODELS_LINE = re.compile(r"^Models:\s*(.+)$", re.M)
+_FORECAST_LINE = re.compile(r"^Forecast:\s*(.+)$", re.M)
+
+
+def latest_comments(client: MetaculusClient, me_id: int, limit: int = 6) -> list[str]:
+    """One line per recent comment: when, where, which models, what forecast.
+
+    The comment is written from the same run that submitted the forecast, so
+    this is the quickest outside check that the live pipeline works end to
+    end: which models answered, and that the comment went up.
+    """
+    lines = []
+    for c in client.my_recent_comments(me_id, limit=limit):
+        text = c.get("text") or ""
+        models = _MODELS_LINE.search(text)
+        forecast = _FORECAST_LINE.search(text)
+        when = _when_iso(c.get("created_at"))
+        post = (c.get("on_post_data") or {}).get("id") or c.get("on_post")
+        lines.append(
+            f"{when} post {post}: {forecast.group(1)[:60] if forecast else 'no forecast line'}; "
+            f"models {models.group(1)[:140] if models else 'not named'}; {len(text)} chars"
+        )
+    return lines
 
 
 def run_audit(client: MetaculusClient, tournaments: list[str]) -> tuple[dict[str, Any], list[TournamentAudit]]:

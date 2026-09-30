@@ -22,7 +22,7 @@ import traceback
 from datetime import datetime, timezone
 
 from . import config, report, research as research_mod
-from .audit import run_audit
+from .audit import latest_comments, run_audit
 from .client import (
     MetaculusClient,
     MetaculusError,
@@ -535,6 +535,11 @@ def _self_audit(client: MetaculusClient) -> None:
     who = me.get("username") or "the bot"
     lines = [f"{who} (id {me.get('id')}), audited in {time.monotonic() - started:.0f}s"]
     lines += [a.line() for a in audits]
+    try:
+        recent = latest_comments(client, me.get("id"))
+        lines.append("latest comments:" + ("\n  " + "\n  ".join(recent) if recent else " none"))
+    except Exception as exc:  # noqa: BLE001 - never let the audit stop a run
+        lines.append(f"latest comments unreadable: {str(exc)[:160]}")
     for line in lines:
         log.info("audit: %s", line)
     clean = all(a.clean for a in audits)

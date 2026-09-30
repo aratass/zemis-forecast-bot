@@ -166,6 +166,23 @@ class MetaculusClient:
         """The account the token belongs to: the bot itself."""
         return self._request("GET", "/users/me/") or {}
 
+    def my_recent_comments(self, author_id: int, limit: int = 6) -> list[dict]:
+        """This account's newest private comments, newest first.
+
+        Private comments are returned only when is_private and the author are
+        both given, and only to their author.
+        """
+        params = [
+            ("author", int(author_id)),
+            ("is_private", "true"),
+            ("sort", "-created_at"),
+            ("limit", int(limit)),
+        ]
+        data = self._request("GET", f"/comments/?{urlencode(params)}")
+        if isinstance(data, dict):
+            return list(data.get("results") or [])
+        return list(data or [])
+
     def project_leaderboard(self, project_id: int) -> list[dict]:
         """The project's primary leaderboard, with this account's own entry.
 

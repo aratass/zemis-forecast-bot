@@ -394,3 +394,15 @@ def test_a_dry_run_keeps_polling_while_questions_wait_and_never_repeats_one(monk
     assert calls == [101, 105, 105] or sorted(calls) == [101, 105, 105], calls
     assert runner.TALLY.duplicates == []
     assert not runner.TALLY.waiting
+
+
+def test_latest_comments_name_the_models_and_the_forecast():
+    class C:
+        def my_recent_comments(self, author_id, limit=6):
+            assert author_id == 7
+            return [{"created_at": "2026-09-30T21:10:00Z", "on_post": 45999,
+                     "text": "Forecast produced automatically.\n\nModels: gemini/models/gemini-3.6-flash\n"
+                             "Research sources: AskNews\n\nForecast: 23.0%\n\nReasoning from one run:\nx"}]
+
+    (line,) = audit.latest_comments(C(), 7)
+    assert line.startswith("09-30 21:10 post 45999: 23.0%; models gemini/models/gemini-3.6-flash;")
