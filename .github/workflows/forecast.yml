@@ -80,9 +80,10 @@ jobs:
             echo "::warning::WATCHER_PAT is set but cannot read this repository's runs. It probably needs Actions: read and write."
           fi
       - name: self-audit
-        # Its own step so that its annotations (the bot's record, and the
-        # models this watcher will use) are readable a minute after start,
-        # not when the five-hour forecast step ends. Reads only; never blocks.
+        # The bot's record and the models this watcher will use, as
+        # annotations. Its own step so that a failure here can never stop the
+        # watcher. GitHub attaches annotations when the whole job ends; for a
+        # reading within minutes, run the check-sources workflow instead.
         continue-on-error: true
         timeout-minutes: 5
         env:

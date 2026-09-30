@@ -422,8 +422,7 @@ def main(argv: list[str] | None = None) -> int:
 
     models = resolve_models(config.ENSEMBLE_MODELS)
     if args.audit_only:
-        # Its own workflow step, so its annotations appear a minute after a
-        # watcher starts instead of when the five-hour step ends.
+        # Its own workflow step, so that a failure here never stops a watcher.
         strong = [m for m in models if m not in FALLBACK_ONLY]
         lines = [
             f"strong models: {', '.join(strong) or 'none'}",
