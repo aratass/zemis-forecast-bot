@@ -516,7 +516,18 @@ def chat(
         if not resp.ok:
             raise LLMError(f"{prov.name} {bare_model} -> HTTP {resp.status_code}: {resp.text[:400]}")
 
-        data = resp.json()
+        try:
+            data = resp.json()
+        except ValueError:
+            # Seen in the first dry run: gemini-3.7-flash answered 200 with a
+            # body that was not JSON, and the exception escaped every handler
+            # and ended the run. Treat it like an overload.
+            last = f"HTTP {resp.status_code} with an unreadable body {(resp.text or '')[:60]!r}"
+            _COOLDOWN_UNTIL[model] = time.monotonic() + COOLDOWN_SECONDS
+            log.info("%s %s: %s", prov.name, bare_model, last)
+            if attempt < attempts:
+                time.sleep(min(5.0 * attempt, 20.0))
+            continue
         try:
             choice = data["choices"][0]
             text = choice["message"]["content"]
@@ -604,6 +615,8 @@ def probe(models: Sequence[str]) -> dict[str, str]:
             out[model] = f"unavailable: {str(exc)[:200]}"
         except LLMError as exc:
             out[model] = f"failed: {str(exc)[:200]}"
+        except Exception as exc:  # noqa: BLE001 - a probe must never end the run
+            out[model] = f"crashed: {type(exc).__name__}: {str(exc)[:160]}"
     return out
 
 

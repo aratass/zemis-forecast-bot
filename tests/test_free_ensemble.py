@@ -466,3 +466,28 @@ def test_the_probe_reports_each_model_without_thinking(wire):
     assert out[FLASH[1]].startswith("failed") and "overloaded" in out[FLASH[1]]
     assert all("reasoning_effort" not in s["body"] for s in sent)
     assert len(sent) == 2, "one request per model, no retries"
+
+
+class BadBody(Resp):
+    def json(self):
+        raise ValueError("Expecting value: line 1 column 1 (char 0)")
+
+
+def test_an_ok_answer_with_an_unreadable_body_falls_through_to_the_next_model(wire):
+    """The first dry run ended here: 3.7 Flash answered 200 with a body that was not JSON."""
+    sent, sleeps, queue = wire
+    queue.extend([BadBody(200, ""), BadBody(200, ""), Resp(content="PROBABILITY: 20%")])
+    text, used = llm.chat_with_fallback(
+        [{"role": "user", "content": "x"}], [FLASH[1], FLASH[2]], attempts=2
+    )
+    assert used == FLASH[2] and text == "PROBABILITY: 20%"
+    assert llm.model_available(FLASH[1]), "an unreadable answer is not a reason to write the model off"
+
+
+def test_the_probe_survives_anything(wire, monkeypatch):
+    def explode(*a, **k):
+        raise KeyError("surprise")
+
+    monkeypatch.setattr(llm, "chat", explode)
+    out = llm.probe([FLASH[0]])
+    assert out[FLASH[0]].startswith("crashed")
