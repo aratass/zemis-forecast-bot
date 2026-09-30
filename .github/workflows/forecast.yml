@@ -32,12 +32,19 @@ on:
         type: boolean
         default: false
 
+# One watcher at a time on main. A run on any other branch (a dry run of a
+# change, say) gets its own group: in the shared group it would sit pending
+# behind a five hour watcher and then be cancelled by the watcher's own
+# handover, which also queues in that group.
 concurrency:
-  group: forecast-watcher
+  group: ${{ github.ref_name == 'main' && 'forecast-watcher' || format('forecast-trial-{0}', github.ref_name) }}
   cancel-in-progress: false
 
+# models: read lets the job's own GITHUB_TOKEN call GitHub Models, the free
+# GPT-4.1 stand-in. Nothing else is granted.
 permissions:
   contents: read
+  models: read
 
 jobs:
   forecast:
@@ -83,6 +90,7 @@ jobs:
           ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GITHUB_MODELS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Repository variable, so reasoning effort can be turned down
           # without a deploy if it starts costing coverage. Empty means high.
           BOT_REASONING: ${{ vars.BOT_REASONING }}
