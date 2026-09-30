@@ -149,6 +149,30 @@ Model ids are resolved at runtime from the provider catalogue rather than
 pinned, because a season runs four months and model names change inside that
 window.
 
+## Seeing what a run did
+
+GitHub shows a public repository's run logs only to signed-in users. So every
+run also writes what matters as annotations, which the checks API returns to
+any reader (`GET /repos/{owner}/{repo}/check-runs/{job_id}/annotations`), and
+to the job summary on the run page:
+
+- **self-audit**, first: from the server's side, how many questions the bot
+  has forecast in each scored tournament, how many resolved, the summed spot
+  peer, peer and baseline scores on those, its leaderboard rank, and whether
+  any forecast question lacks its comment, was forecast twice, sits at exactly
+  50 percent, or has a malformed distribution. It only reads; `BOT_AUDIT=off`
+  skips it.
+- **ensemble**: the strong models, the stand-ins, which keys are present (by
+  name), and in a dry run a one-line probe of every model.
+- **one note per forecast**, until the per-step budget of ten runs out: the
+  payload, the models that answered, the evidence each source returned, the
+  checks, and in a dry run the start of the comment.
+- **run tally**, last, with a slot reserved so it is never crowded out.
+
+Every forecast is checked before it is sent. One the server would reject is
+held back and the question stays open for the next poll; a binary at exactly
+50 percent is reported but sent, since it can be the ensemble's real answer.
+
 ## Measuring it
 
 ```bash

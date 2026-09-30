@@ -128,10 +128,12 @@ def test_only_a_dry_run_in_test_mode_re_forecasts(monkeypatch):
         def __init__(self, dry_run=False):
             super().__init__({}, dry_run=dry_run)
 
-    def fake_tick(client, tournaments, models, runs, limit, include_forecast=False):
+    def fake_tick(client, tournaments, models, runs, limit, include_forecast=False, diverse=False):
         seen[tuple(tournaments)] = (include_forecast, limit)
+        assert diverse == include_forecast, "only a test-area dry run samples by type"
         return 0
 
+    monkeypatch.setenv("BOT_AUDIT", "off")
     monkeypatch.setattr(runner, "MetaculusClient", FakeMetaculus)
     monkeypatch.setattr(runner, "resolve_models", lambda n: ["a/one"])
     monkeypatch.setattr(runner, "run_tick", fake_tick)

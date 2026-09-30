@@ -21,7 +21,8 @@ import time
 import traceback
 from datetime import datetime, timezone
 
-from . import config, research as research_mod
+from . import config, report, research as research_mod
+from .audit import run_audit
 from .client import (
     MetaculusClient,
     MetaculusError,
@@ -34,22 +35,30 @@ from .forecast import (
     EnsembleTooThin,
     build_context,
     forecast_question,
+    forget,
     search_queries,
 )
 from .llm import (
     DEAD_MODELS,
     EXHAUSTED_UNTIL,
     FALLBACK_ONLY,
+    REASONING_EFFORT,
     USAGE,
     LLMError,
     NoModelsAvailable,
+    catalogue_report,
     metaculus_proxy_models,
     probe,
     provider_is_metered,
     resolve_models,
 )
 
+from .monitor import ForecastRecord, RunTally, check_comment, check_payload, is_rejectable
+
 log = logging.getLogger("bot")
+
+# What this process has done, for the end-of-run tally and the annotations.
+TALLY = RunTally()
 
 SUPPORTED = {"binary", "multiple_choice"} | CONTINUOUS_TYPES
 
@@ -134,19 +143,19 @@ def collect_targets(
 # Research per question for the life of the watcher. A question that waits
 # for more strong answers is polled again every few minutes, and repeating the
 # search each time would spend the finite AskNews allowance for nothing.
-_RESEARCH: dict[int, tuple[str, list[str]]] = {}
+_RESEARCH: dict[int, tuple[str, list[str], str]] = {}
 
 
-def _research(ctx: dict, models: list[str]) -> tuple[str, list[str]]:
+def _research(ctx: dict, models: list[str]) -> tuple[str, list[str], str]:
     qid = ctx["question_id"]
     if qid in _RESEARCH:
         return _RESEARCH[qid]
     queries = search_queries(ctx, models)
-    report = research_mod.gather(queries, ctx=ctx)
-    log.info("q%s evidence: %s", qid, report.source_mix)
-    if report.errors:
-        log.warning("q%s research issues: %s", qid, "; ".join(report.errors)[:300])
-    _RESEARCH[qid] = (report.render(), report.source_names)
+    report_ = research_mod.gather(queries, ctx=ctx)
+    log.info("q%s evidence: %s", qid, report_.source_mix)
+    if report_.errors:
+        log.warning("q%s research issues: %s", qid, "; ".join(report_.errors)[:300])
+    _RESEARCH[qid] = (report_.render(), report_.source_names, report_.source_mix)
     return _RESEARCH[qid]
 
 
@@ -155,7 +164,7 @@ def handle_one(client: MetaculusClient, post: dict, question: dict, models: list
     qid = ctx["question_id"]
     title = ctx["title"][:90]
 
-    research_text, research_sources = _research(ctx, models)
+    research_text, research_sources, source_mix = _research(ctx, models)
 
     forecast = forecast_question(
         post=post,
@@ -166,21 +175,65 @@ def handle_one(client: MetaculusClient, post: dict, question: dict, models: list
         runs=runs,
     )
 
+    problems = check_payload(forecast.payload, question) + check_comment(forecast.comment)
+    if is_rejectable(problems):
+        # The server would refuse it, and a refused forecast still costs the
+        # attempt. Keep the question open for the next poll instead.
+        TALLY.hold_back(qid)
+        _RESEARCH.pop(qid, None)
+        forget(qid)
+        raise ValueError(f"held back, would be rejected: {'; '.join(problems)[:300]}")
+
     client.submit_forecasts([forecast.payload])
+    forget(qid)
     # The comment is a prize-eligibility requirement, so a failure here is
     # logged loudly rather than swallowed, but it must not undo the forecast.
     try:
         client.post_comment(forecast.post_id, forecast.comment)
     except MetaculusError as exc:
         log.error("q%s forecast submitted but comment FAILED: %s", qid, exc)
+        TALLY.comment_failed(qid)
+        report.annotate("error", f"comment failed on q{qid}", f"{title}\n{str(exc)[:600]}")
 
     log.info("q%s %-14s %s | %s", qid, forecast.question_type, forecast.headline, title)
     log.info("q%s answered by %s", qid, ", ".join(forecast.models_used) or "nobody")
     for note in forecast.notes:
         log.info("  q%s: %s", qid, note)
+    if problems:
+        log.warning("q%s checks: %s", qid, "; ".join(problems))
     if client.dry_run:
         log.info("q%s dry run payload: %s", qid, _payload_summary(forecast.payload))
         log.info("q%s dry run comment (%d chars):\n%s", qid, len(forecast.comment), forecast.comment[:1500])
+
+    TALLY.forecast(
+        ForecastRecord(
+            question_id=qid,
+            question_type=forecast.question_type,
+            headline=forecast.headline,
+            models=list(forecast.models_used),
+            sources=source_mix,
+            problems=problems,
+            comment_chars=len(forecast.comment),
+        )
+    )
+    lines = [
+        f"{title}",
+        f"{'would submit' if client.dry_run else 'submitted'}: {_payload_summary(forecast.payload)}",
+        f"headline: {forecast.headline}",
+        f"answered by: {', '.join(forecast.models_used) or 'nobody'}",
+        f"evidence: {source_mix}",
+        f"checks: {'; '.join(problems) if problems else 'all passed'}",
+        f"comment: {len(forecast.comment)} characters",
+    ]
+    if client.dry_run:
+        lines.append("")
+        lines.append(forecast.comment[:1600])
+    report.annotate(
+        "warning" if problems else "notice",
+        f"{'dry run ' if client.dry_run else ''}q{qid} {forecast.question_type}",
+        "\n".join(lines),
+        reserve=1,
+    )
     _RESEARCH.pop(qid, None)
     return forecast.headline
 
@@ -198,6 +251,25 @@ def _payload_summary(payload: dict) -> str:
     return str(payload)[:200]
 
 
+def one_of_each_type(targets: list[tuple[dict, dict]], limit: int) -> list[tuple[dict, dict]]:
+    """Take questions type by type, so a small dry run still covers every type.
+
+    The bot testing area holds one open question of each type plus two groups;
+    the first eight in server order were mostly group members of one type.
+    """
+    by_type: dict[str, list[tuple[dict, dict]]] = {}
+    for pair in targets:
+        by_type.setdefault(pair[1].get("type") or "", []).append(pair)
+    picked: list[tuple[dict, dict]] = []
+    depth = 0
+    while len(picked) < limit and any(len(v) > depth for v in by_type.values()):
+        for pairs in by_type.values():
+            if depth < len(pairs) and len(picked) < limit:
+                picked.append(pairs[depth])
+        depth += 1
+    return picked
+
+
 def run_tick(
     client: MetaculusClient,
     tournaments: list[str],
@@ -205,12 +277,15 @@ def run_tick(
     runs: int,
     limit: int,
     include_forecast: bool = False,
+    diverse: bool = False,
 ) -> int:
     targets = collect_targets(client, tournaments, include_forecast=include_forecast)
     if not targets:
         log.info("nothing new to forecast")
         return 0
-    if len(targets) > limit:
+    if diverse:
+        targets = one_of_each_type(targets, limit)
+    elif len(targets) > limit:
         # Oldest first: those are closest to closing.
         log.warning("%d questions pending, taking the %d nearest to closing", len(targets), limit)
         targets = targets[:limit]
@@ -232,14 +307,21 @@ def run_tick(
             except EnsembleTooThin as exc:
                 # Not a failure: the question waits for more strong answers.
                 waiting += 1
+                TALLY.wait(qid)
                 log.info("q%s waiting: %s", qid, str(exc)[:200])
             except NoModelsAvailable as exc:
                 outage += 1
+                TALLY.fail(qid, f"no model available: {exc}")
                 log.error("q%s skipped, no model available: %s", qid, str(exc)[:300])
             except (LLMError, MetaculusError, ValueError) as exc:
+                TALLY.fail(qid, str(exc))
                 log.error("q%s failed: %s", qid, str(exc)[:400])
+                report.annotate("warning", f"q{qid} failed", str(exc)[:1500], reserve=1)
             except Exception:  # noqa: BLE001 - one bad question must not end the tick
-                log.error("q%s crashed:\n%s", qid, traceback.format_exc()[:1500])
+                trace = traceback.format_exc()
+                TALLY.fail(qid, trace.strip().splitlines()[-1])
+                log.error("q%s crashed:\n%s", qid, trace[:1500])
+                report.annotate("error", f"q{qid} crashed", trace[-1500:], reserve=1)
     if waiting:
         log.info("%d question(s) waiting for more strong-model answers", waiting)
     if outage:
@@ -264,11 +346,11 @@ def check_sources() -> int:
     a source can be reachable in one place and blocked in another.
     """
     setup_logging()
-    report = research_mod.gather(["european central bank interest rate decision"])
+    found = research_mod.gather(["european central bank interest rate decision"])
     by_source: dict[str, int] = {}
-    for item in report.items:
+    for item in found.items:
         by_source[item.source] = by_source.get(item.source, 0) + 1
-    print(json.dumps({"items_by_source": by_source, "errors": report.errors}, indent=2))
+    print(json.dumps({"items_by_source": by_source, "errors": found.errors}, indent=2))
     try:
         models = resolve_models(config.ENSEMBLE_MODELS)
         print(json.dumps({"models_resolved": models}, indent=2))
@@ -313,15 +395,18 @@ def main(argv: list[str] | None = None) -> int:
         log.error("%s", exc)
         return 2
 
+    _self_audit(client)
+
     models = resolve_models(config.ENSEMBLE_MODELS)
     runs = args.runs
     if provider_is_metered() and runs == config.RUNS_PER_QUESTION:
         runs = config.RUNS_PER_QUESTION_METERED if FALLBACK_ONLY else config.RUNS_PER_QUESTION_UNTIERED
         log.info("provider is rate limited, using %d runs per question", runs)
     strong = [m for m in models if m not in FALLBACK_ONLY]
+    stand_ins = [m for m in models if m in FALLBACK_ONLY]
     log.info("ensemble: %s", ", ".join(strong))
     if FALLBACK_ONLY:
-        log.info("stand-ins, used only near the deadline: %s", ", ".join(m for m in models if m in FALLBACK_ONLY))
+        log.info("stand-ins, used only near the deadline: %s", ", ".join(stand_ins))
 
     # A dry run in the bot testing area re-forecasts questions the bot has
     # already answered there, since nothing is submitted; anywhere else a dry
@@ -331,18 +416,45 @@ def main(argv: list[str] | None = None) -> int:
     limit = args.limit
     if args.dry_run and limit == config.MAX_QUESTIONS_PER_TICK:
         limit = config.DRY_RUN_LIMIT
+    ensemble_lines = [
+        f"mode {args.mode}, tournaments {', '.join(map(str, tournaments))}, "
+        f"{'dry run, nothing submitted' if args.dry_run else 'live'}",
+        f"strong models: {', '.join(strong) or 'none'}",
+        f"stand-ins (near the deadline only): {', '.join(stand_ins) or 'none'}",
+        f"runs per question: {runs}; strong answers needed: {config.MIN_STRONG_ANSWERS}; "
+        f"stand-ins allowed within {config.DEFER_MARGIN_MINUTES} min of close",
+        f"reasoning effort: {REASONING_EFFORT}",
+        f"keys present: {', '.join(_keys_present()) or 'none'}",
+    ]
     if args.dry_run:
         for model, outcome in probe(models).items():
             log.info("probe %s: %s", model, outcome)
+            ensemble_lines.append(f"probe {model}: {outcome}")
+        try:
+            ensemble_lines.extend(catalogue_report())
+        except Exception as exc:  # noqa: BLE001 - a report must not stop a run
+            ensemble_lines.append(f"catalogues unreadable: {str(exc)[:120]}")
+    report.annotate("notice", "ensemble", "\n".join(ensemble_lines))
+    report.summary("### Ensemble\n\n" + "\n".join(f"- {line}" for line in ensemble_lines))
 
     deadline = time.monotonic() + args.watch if args.watch else None
     total = 0
     while True:
         started = time.monotonic()
         try:
-            total += run_tick(client, tournaments, models, runs, limit, include_forecast)
+            total += run_tick(
+                client,
+                tournaments,
+                models,
+                runs,
+                limit,
+                include_forecast,
+                diverse=bool(args.dry_run and include_forecast),
+            )
         except Exception:  # noqa: BLE001 - a watch loop must outlive one bad tick
-            log.error("tick crashed:\n%s", traceback.format_exc()[:2000])
+            trace = traceback.format_exc()
+            log.error("tick crashed:\n%s", trace[:2000])
+            report.annotate("error", "tick crashed", trace[-1500:], reserve=1)
 
         if deadline is None:
             break
@@ -354,7 +466,53 @@ def main(argv: list[str] | None = None) -> int:
         time.sleep(nap)
 
     log.info("forecast %d question(s) this run. LLM usage: %s", total, USAGE.summary())
+    tally = TALLY.lines() + [f"LLM usage: {USAGE.summary()}"]
+    for line in tally:
+        log.info("tally: %s", line)
+    troubled = bool(TALLY.with_problems or TALLY.duplicates or TALLY.comment_failures or TALLY.held_back)
+    report.annotate("warning" if troubled else "notice", "run tally", "\n".join(tally))
+    report.summary("### Run tally\n\n" + "\n".join(f"- {line}" for line in tally))
     return 0
+
+
+def _keys_present() -> list[str]:
+    """Which optional keys this run holds, by name only. Never the values."""
+    names = (
+        "OPENROUTER_API_KEY",
+        "GEMINI_API_KEY",
+        "GROQ_API_KEY",
+        "GITHUB_MODELS_TOKEN",
+        "ASKNEWS_CLIENT_ID",
+        "ASKNEWS_SECRET",
+    )
+    return [n for n in names if os.environ.get(n)]
+
+
+def _self_audit(client: MetaculusClient) -> None:
+    """Read the bot's own record in the scored tournaments, and publish it.
+
+    Always the scored tournaments, whatever this run forecasts, because that
+    record is what the prize depends on. BOT_AUDIT=off skips it.
+    """
+    if (os.environ.get("BOT_AUDIT") or "").strip().lower() in ("off", "0", "false", "no"):
+        return
+    started = time.monotonic()
+    try:
+        me, audits = run_audit(client, config.MODES["tournament"])
+    except Exception as exc:  # noqa: BLE001 - never let the audit stop a run
+        log.error("self-audit crashed: %s", str(exc)[:300])
+        return
+    if not audits:
+        report.annotate("warning", "self-audit", "could not read the bot's own record")
+        return
+    who = me.get("username") or "the bot"
+    lines = [f"{who} (id {me.get('id')}), audited in {time.monotonic() - started:.0f}s"]
+    lines += [a.line() for a in audits]
+    for line in lines:
+        log.info("audit: %s", line)
+    clean = all(a.clean for a in audits)
+    report.annotate("notice" if clean else "warning", "self-audit", "\n".join(lines))
+    report.summary("### Self-audit\n\n" + "\n".join(f"- {line}" for line in lines))
 
 
 if __name__ == "__main__":

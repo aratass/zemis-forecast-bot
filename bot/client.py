@@ -122,19 +122,26 @@ class MetaculusClient:
     def iter_posts(
         self,
         tournament: str | int,
-        statuses: str = "open",
+        statuses: str | list[str] = "open",
         page_size: int = 100,
         max_pages: int = 20,
+        extra: list[tuple[str, Any]] | None = None,
+        include_descriptions: bool = True,
     ) -> Iterator[dict]:
-        """Yield posts in a tournament. ``tournament`` may be a slug or an id."""
+        """Yield posts in a tournament. ``tournament`` may be a slug or an id.
+
+        ``statuses`` may name several; the server reads them as a repeated
+        parameter. ``extra`` adds filters such as forecaster_id.
+        """
+        status_list = [statuses] if isinstance(statuses, str) else list(statuses)
         offset = 0
         for _ in range(max_pages):
             params = [
                 ("limit", page_size),
                 ("offset", offset),
                 ("tournaments", tournament),
-                ("statuses", statuses),
-                ("include_descriptions", "true"),
+                *[("statuses", s) for s in status_list],
+                ("include_descriptions", "true" if include_descriptions else "false"),
                 ("order_by", "open_time"),
                 # Without with_cp the server never attaches my_forecasts, and
                 # already_forecast() then answers "no" for every question, so
@@ -142,6 +149,7 @@ class MetaculusClient:
                 # tournament rules ask for one forecast per question, so this
                 # parameter is load bearing, not a nicety.
                 ("with_cp", "true"),
+                *(extra or []),
             ]
             data = self._request("GET", f"/posts/?{urlencode(params)}")
             results = (data or {}).get("results") or []
@@ -153,6 +161,19 @@ class MetaculusClient:
 
     def get_post(self, post_id: int) -> dict:
         return self._request("GET", f"/posts/{post_id}/")
+
+    def me(self) -> dict:
+        """The account the token belongs to: the bot itself."""
+        return self._request("GET", "/users/me/") or {}
+
+    def project_leaderboard(self, project_id: int) -> list[dict]:
+        """The project's primary leaderboard, with this account's own entry.
+
+        The server adds "userEntry" for the requesting account even when the
+        public view hides it.
+        """
+        data = self._request("GET", f"/leaderboards/project/{int(project_id)}/?primary_only=true")
+        return data if isinstance(data, list) else []
 
     # -- writes ------------------------------------------------------------
     def submit_forecasts(self, payloads: list[dict]) -> None:

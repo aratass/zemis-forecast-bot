@@ -318,6 +318,11 @@ def _error_brief(resp) -> str:
     quotas = sorted(set(re.findall(r'"quotaId"\s*:\s*"([^"]+)"', text)))
     if quotas:
         parts.append("quota " + ",".join(quotas))
+    # Google names the size of the allowance too, which is the only public
+    # place a free key's daily limit can be read.
+    values = sorted(set(re.findall(r'"quotaValue"\s*:\s*"?(\d+)', text)))
+    if values:
+        parts.append("limit " + ",".join(values))
     message = err.get("message")
     if message:
         parts.append(re.sub(r"\s+", " ", str(message))[:160])
@@ -552,7 +557,15 @@ def chat(
         if isinstance(usage.get("cost"), (int, float)):
             cost = float(usage["cost"])
         USAGE.record(model, usage, cost)
-        return text or ""
+        if not (text or "").strip():
+            # An empty answer parses to nothing, and returning it would end the
+            # fallback chain on a run that produced no forecast. Let the next
+            # model try instead.
+            raise LLMError(
+                f"{prov.name} {bare_model} returned an empty answer "
+                f"(finish_reason {choice.get('finish_reason')!r})"
+            )
+        return text
 
     raise LLMError(f"{prov.name} {bare_model} failed after {attempts} attempts: {last}")
 
@@ -706,6 +719,47 @@ def provider_catalogue(prov: Provider) -> list[str]:
         if mid and not EXCLUDE.search(str(mid)):
             out.append(str(mid))
     return out
+
+
+def catalogue_report() -> list[str]:
+    """What each keyed free provider offers, one line each, for a dry run.
+
+    Chooses nothing. It exists so that a dry run's annotation shows which
+    strong models were on offer, not only the ones the resolver picked.
+    """
+    lines: list[str] = []
+    gemini = PROVIDERS["gemini"]
+    if gemini.key:
+        flash = sorted(
+            (m for m in provider_catalogue(gemini) if _FLASH.search(m)),
+            key=lambda m: (-(gemini_version(m) or 0.0), m),
+        )
+        lines.append("gemini flash ids: " + (", ".join(m.split("/", 1)[-1] for m in flash[:12]) or "none listed"))
+    github = PROVIDERS["github"]
+    if github.key:
+        try:
+            resp = requests.get(
+                "https://models.github.ai/catalog/models",
+                headers={"Authorization": f"Bearer {github.key}", "Accept": "application/vnd.github+json"},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            entries = resp.json()
+            rows = [
+                f"{e.get('id')} ({e.get('rate_limit_tier') or '?'})"
+                for e in (entries if isinstance(entries, list) else [])
+                if isinstance(e, dict) and re.match(r"^(openai|xai|deepseek|meta|mistral-ai|microsoft|cohere|ai21-labs)/", str(e.get("id") or ""))
+            ]
+            lines.append("github models: " + (", ".join(rows[:40]) or "none listed"))
+        except Exception as exc:  # noqa: BLE001 - a report must not stop a run
+            lines.append(f"github models: catalogue unreadable ({str(exc)[:120]})")
+    if PROVIDERS["openrouter"].key:
+        free = [str(e.get("id")) for e in _catalogue() if str(e.get("id") or "").endswith(":free")]
+        lines.append("openrouter free ids: " + (", ".join(free[:25]) or "none listed"))
+    groq = PROVIDERS["groq"]
+    if groq.key:
+        lines.append("groq ids: " + (", ".join(provider_catalogue(groq)[:20]) or "none listed"))
+    return lines
 
 
 def _rank_bare(ids: Sequence[str]) -> list[str]:

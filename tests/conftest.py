@@ -58,3 +58,17 @@ def fresh_model_state():
     clear()
     yield
     clear()
+
+
+@pytest.fixture(autouse=True)
+def not_on_actions(monkeypatch):
+    """Tests run on GitHub Actions in CI. Nothing a test does may become an
+    annotation or a line in that CI run's job summary, so both are switched off
+    unless a test turns them on for itself."""
+    from bot import report
+
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+    report.reset()
+    yield
+    report.reset()

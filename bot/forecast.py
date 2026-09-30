@@ -44,6 +44,12 @@ class EnsembleTooThin(LLMError):
 # the watcher so a question that waits does not pay for its answers twice.
 _STRONG_ANSWERS: dict[tuple, list[tuple[str, str]]] = {}
 
+def forget(question_id: int) -> None:
+    """Drop the kept answers for a question once its forecast has gone out."""
+    for key in [k for k in _STRONG_ANSWERS if k and k[0] == question_id]:
+        _STRONG_ANSWERS.pop(key, None)
+
+
 # How much of one run's reasoning goes into the comment.
 COMMENT_REASONING_CHARS = 3500
 
@@ -237,9 +243,12 @@ def _run_ensemble(
             r for r in out if r[1] not in FALLBACK_ONLY and (usable is None or usable(r[0]))
         )
     combined = cached + out
+    if not combined and not allow_fallback and fallbacks:
+        # Nothing strong answered, overloaded or out for the day, and the
+        # question is open long enough to ask again. Stand-ins stay behind for
+        # the deadline; nothing is submitted now.
+        raise EnsembleTooThin("no strong model answered this poll; waiting for the next one")
     if not combined and dead:
-        if not allow_fallback and any(model_available(m) for m in fallbacks):
-            raise EnsembleTooThin("no strong model can answer right now; waiting for the next poll")
         # Nothing answered at all. That is the LLM layer being down, not the
         # models being unsure, and the two must not be confused: see the callers.
         raise NoModelsAvailable(
