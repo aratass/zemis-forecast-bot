@@ -57,7 +57,19 @@ def _keys(monkeypatch, **present):
 
 
 # -- which models --------------------------------------------------------------
+def test_by_default_the_flash_versions_forecast_alone(monkeypatch):
+    """A weak stand-in scores below the zero of a question left alone."""
+    _keys(monkeypatch, GEMINI_API_KEY="g", GROQ_API_KEY="q")
+    _serve(
+        monkeypatch,
+        {"gemini": ["models/gemini-3.8-flash", "models/gemini-3.5-flash"], "groq": ["openai/gpt-oss-120b"]},
+    )
+    assert llm.resolve_models(3) == ["gemini/models/gemini-3.8-flash", "gemini/models/gemini-3.5-flash"]
+    assert llm.TIERED and not llm.FALLBACK_ONLY
+
+
 def test_up_to_four_flash_versions_newest_first_one_id_each(monkeypatch):
+    monkeypatch.setattr(llm, "STAND_INS_ENABLED", True)
     _keys(monkeypatch, GEMINI_API_KEY="g", GROQ_API_KEY="q")
     _serve(
         monkeypatch,
@@ -117,6 +129,7 @@ def test_with_too_few_flash_models_the_old_spread_is_kept(monkeypatch):
 
 def test_free_stand_ins_are_ordered_strongest_first(monkeypatch):
     """Nemotron 3 Ultra +5.83, GPT-OSS 120B -0.26. GitHub Models is retired."""
+    monkeypatch.setattr(llm, "STAND_INS_ENABLED", True)
     _keys(
         monkeypatch,
         GEMINI_API_KEY="g",
@@ -547,3 +560,31 @@ def test_the_probe_survives_anything(wire, monkeypatch):
     monkeypatch.setattr(llm, "chat", explode)
     out = llm.probe([FLASH[0]])
     assert out[FLASH[0]].startswith("crashed")
+
+
+def test_without_stand_ins_a_question_nobody_strong_answers_is_left_alone(monkeypatch):
+    llm.TIERED = True
+
+    def overloaded(messages, models, **kwargs):
+        assert STAND_IN not in models
+        raise llm.LLMError("HTTP 503 overloaded")
+
+    with pytest.raises(EnsembleTooThin):
+        _forecast(_question(q_binary, 80), monkeypatch, overloaded)
+    with pytest.raises(llm.LLMError) as err:
+        _forecast(_question(q_binary, 10), monkeypatch, overloaded)
+    assert not isinstance(err.value, EnsembleTooThin)
+
+
+def test_without_stand_ins_one_flash_answer_at_the_deadline_is_used(monkeypatch):
+    llm.TIERED = True
+    replies = iter([("PROBABILITY: 12%", FLASH[0])])
+
+    def one(messages, models, **kwargs):
+        try:
+            return next(replies)
+        except StopIteration:
+            raise llm.LLMError("HTTP 503 overloaded")
+
+    forecast = _forecast(_question(q_binary, 10), monkeypatch, one)
+    assert forecast.models_used == [FLASH[0]]

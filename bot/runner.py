@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 
 from . import config, report, research as research_mod
 from . import forecast as forecast_mod
+from . import llm as llm_mod
 from .audit import latest_comments, run_audit
 from .client import (
     MetaculusClient,
@@ -433,7 +434,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     runs = args.runs
     if provider_is_metered() and runs == config.RUNS_PER_QUESTION:
-        runs = config.RUNS_PER_QUESTION_METERED if FALLBACK_ONLY else config.RUNS_PER_QUESTION_UNTIERED
+        runs = config.RUNS_PER_QUESTION_METERED if llm_mod.TIERED or FALLBACK_ONLY else config.RUNS_PER_QUESTION_UNTIERED
         log.info("provider is rate limited, using %d runs per question", runs)
     strong = [m for m in models if m not in FALLBACK_ONLY]
     stand_ins = [m for m in models if m in FALLBACK_ONLY]
@@ -453,7 +454,7 @@ def main(argv: list[str] | None = None) -> int:
         f"mode {args.mode}, tournaments {', '.join(map(str, tournaments))}, "
         f"{'dry run, nothing submitted' if args.dry_run else 'live'}",
         f"strong models: {', '.join(strong) or 'none'}",
-        f"stand-ins (near the deadline only): {', '.join(stand_ins) or 'none'}",
+        f"stand-ins (near the deadline only): {', '.join(stand_ins) or 'none, by design (BOT_STAND_INS=off)'}",
         f"runs per question: {runs}; strong answers needed: {config.MIN_STRONG_ANSWERS}; "
         f"stand-ins allowed within {config.DEFER_MARGIN_MINUTES} min of close",
         f"reasoning effort: {REASONING_EFFORT}",

@@ -38,24 +38,30 @@ Being clever comes third.
    independently; a dead endpoint costs a log line, never the forecast.
 3. **Ensemble.** On free keys, four runs, one led by each of the newest
    Gemini Flash versions the key can see (3.5 and newer), with every run
-   falling through the other Flash versions before anything else. Other free
-   models (OpenRouter's free Nemotron 3 Ultra when a key is present, then
-   Groq's gpt-oss-120b) only stand in, and only when the question is within
-   30 minutes of closing and fewer than two Flash answers are in. Until then
-   the question waits for the next poll and keeps the answers it has. At the
-   deadline any Flash answers speak alone; stand-ins are used only when no
-   Flash model answered at all. The reason is measured: Metaculus's
-   FutureEval model leaderboard scores Gemini 3.5 Flash at +12.17 and 3.6
-   Flash at +13.22 against GPT-4o, and gpt-oss-120b at -0.26, and in the
-   Summer 2026 bot tournament Metaculus's own simple Gemini 3.5 Flash bot
-   finished with +2,533 points (26th of 192 bots, in the paid zone) while its
-   GPT-4o bot finished with -2,565 (178th). The free tier gives each Flash
-   version 20 requests a day. With sponsored credits the old design applies:
-   runs across three model families. The prompt asks for the status quo
-   outcome, an explicit base rate and reference class, what the evidence
-   establishes, the case each way, and how much can change in the time left.
-   It does not use multi-persona or "think like a Bayesian" framing, both of
-   which measured worse than plain reasoning in published evaluations.
+   falling through the other Flash versions. A question waits for the next
+   poll until two Flash answers are in, keeping the answers it has, and stops
+   waiting 30 minutes before close or as soon as every Flash version is out of
+   its allowance until after that point; then whatever Flash answers exist
+   are used. If no Flash model answers at all, nothing is submitted. The
+   reason is measured: Metaculus's FutureEval model leaderboard scores Gemini
+   3.5 Flash at +12.17 and 3.6 Flash at +13.22 against GPT-4o, and
+   gpt-oss-120b at -0.26. In the Summer 2026 bot season Metaculus's own
+   simple Gemini 3.5 Flash bot finished with +2,533 points (26th of 192 bots,
+   in the paid zone) while its GPT-4o bot finished with -2,565 (178th), about
+   -8 points a question. A question left alone scores zero, so a weak
+   stand-in forecast loses points on average: across Metaculus's model bots
+   the score per question crosses zero near a board score of 5 to 6, and
+   every free stand-in (gpt-oss-120b, Gemma 4, Flash-Lite) is below it.
+   `BOT_STAND_INS=on` brings the old stand-ins back (OpenRouter's free
+   Nemotron 3 Ultra when a key is present, then Groq's gpt-oss-120b), used
+   only near the deadline. The free tier gives each Flash version 20 requests
+   a day. With sponsored credits the old design applies: runs across three
+   model families. The prompt asks for the status quo outcome, an explicit
+   base rate and reference class, what the evidence establishes, the case
+   each way, and how much can change in the time left, written out briefly
+   so the comment shows it. It does not use multi-persona or "think like a
+   Bayesian" framing, both of which measured worse than plain reasoning in
+   published evaluations.
 4. **Aggregate.** Median, not mean, so one hallucinated number cannot move the
    answer. Numeric questions take the median percentile by percentile. When
    there are enough Flash answers, stand-in answers are left out of the median
@@ -125,8 +131,8 @@ things if present:
 | --- | --- |
 | `METACULUS_TOKEN` | required: reading questions, submitting, commenting |
 | `GEMINI_API_KEY` | the ensemble on free keys: every Gemini Flash version from 3.5 up |
-| `OPENROUTER_API_KEY` | a free key buys the free Nemotron 3 Ultra stand-in (`OPENROUTER_FREE_ONLY=0` for sponsored credits) |
-| `GROQ_API_KEY` | gpt-oss-120b, the last stand-in |
+| `OPENROUTER_API_KEY` | a free key buys the free Nemotron 3 Ultra stand-in, with `BOT_STAND_INS=on` (`OPENROUTER_FREE_ONLY=0` for sponsored credits) |
+| `GROQ_API_KEY` | gpt-oss-120b, a stand-in used only with `BOT_STAND_INS=on` |
 | `ASKNEWS_CLIENT_ID`, `ASKNEWS_SECRET` | news search via the Metaculus partnership |
 
 GitHub Models is not used: GitHub retired it on 30 July 2026.
@@ -143,7 +149,8 @@ before printing it.
 | `RUNS_PER_QUESTION` | 5 | winners averaged about 28 LLM calls per question |
 | `RUNS_PER_QUESTION_METERED` | 4 | on free keys: one run led by each Flash version |
 | `MIN_STRONG_ANSWERS` | 2 | Flash answers needed before a forecast goes out early |
-| `DEFER_MARGIN_MINUTES` | 30 | inside this, stand-ins are used rather than nothing |
+| `DEFER_MARGIN_MINUTES` | 30 | inside this, whatever Flash answers exist are used |
+| `BOT_STAND_INS` | off | `on` lets weaker free models answer near the deadline |
 | `PRIMARY_GEMINI_MIN_VERSION` | 3.5 | oldest Flash version allowed in the ensemble |
 | `ENSEMBLE_MODELS` | 3 | one per model family |
 | `BOT_MODELS` | unset | comma separated, pins models instead of resolving them |

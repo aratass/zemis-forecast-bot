@@ -15,6 +15,7 @@ from typing import Any, Callable, Sequence
 
 from . import aggregate, config, parsing, prompts
 from .cdf import DEFAULT_INBOUND_OUTCOME_COUNT, build_cdf, percentiles_from_cdf
+from . import llm as _llm
 from .llm import (
     FALLBACK_ONLY,
     cooling_down,
@@ -181,6 +182,11 @@ def search_queries(ctx: dict, models: Sequence[str]) -> list[str]:
 
 
 # -- per-type pipelines ----------------------------------------------------
+def _tiered() -> bool:
+    """The Flash tier is the ensemble: wait for it, and keep its answers apart."""
+    return bool(_llm.TIERED or FALLBACK_ONLY)
+
+
 # Set by the runner for the last poll of a dry run, so that questions still
 # waiting are carried through the deadline path and every type gets checked.
 FORCE_DEADLINE = False
@@ -197,7 +203,7 @@ def can_defer(ctx: dict, models: Sequence[str] = (), now: datetime | None = None
     spends the stand-in's time: on 30 September all four Flash allowances
     were used up by 22:40 UTC and came back at 07:00.
     """
-    if not FALLBACK_ONLY or FORCE_DEADLINE:
+    if not _tiered() or FORCE_DEADLINE:
         return False
     close = ctx.get("close_dt")
     if close is None:
@@ -292,7 +298,7 @@ def _run_ensemble(
             r for r in out if r[1] not in FALLBACK_ONLY and (usable is None or usable(r[0]))
         )
     combined = cached + out
-    if not combined and not allow_fallback and fallbacks:
+    if not combined and not allow_fallback and _tiered():
         # Nothing strong answered, overloaded or out for the day, and the
         # question is open long enough to ask again. Stand-ins stay behind for
         # the deadline; nothing is submitted now.
@@ -313,7 +319,7 @@ def _choose(ctx: dict, parsed: list, runs: int, deferrable: bool, notes: list[st
     stand-ins are left out entirely, because a median of two strong answers and
     two much weaker ones is half the weaker model.
     """
-    if not FALLBACK_ONLY:
+    if not _tiered():
         return parsed
     strong = [p for p in parsed if p[2] not in FALLBACK_ONLY]
     needed = max(1, min(config.MIN_STRONG_ANSWERS, runs))

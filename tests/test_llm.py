@@ -345,6 +345,7 @@ def _serve(monkeypatch, catalogues):
 
 
 def test_flash_versions_lead_and_other_providers_stand_in(monkeypatch):
+    monkeypatch.setattr(llm, "STAND_INS_ENABLED", True)
     monkeypatch.delenv("BOT_MODELS", raising=False)
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     monkeypatch.delenv("GITHUB_MODELS_TOKEN", raising=False)

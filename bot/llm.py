@@ -161,6 +161,21 @@ OPENROUTER_FREE_PREFERENCES = (r"^nvidia/nemotron-3-ultra[^:]*:free$",)
 # every primary model in the same run has failed.
 FALLBACK_ONLY: set[str] = set()
 
+# True when the ensemble is the Flash tier (set by resolve_models), whether or
+# not any stand-in is allowed behind it.
+TIERED = False
+
+# Stand-ins are off unless BOT_STAND_INS=on. A question left alone scores
+# zero, and a weak forecast scores below zero on average. In the Summer 2026
+# bot season (read 30 Sep 2026) Metaculus's own GPT-4o bot, the level of
+# gpt-oss-120b on the model board (0 against -0.26), ended at -2,565 over
+# 326 questions, about -8 a question, while its Gemini 3.5 Flash bot ended at
+# +2,533. Across Metaculus's model bots the tournament score per question
+# crosses zero near a board score of 5 to 6; every free stand-in available
+# (gpt-oss-120b -0.26, Gemma 4 +2.52, Flash-Lite +0.70 to +1.88) is below
+# that. So by default the bot forecasts with Flash or not at all.
+STAND_INS_ENABLED = (os.environ.get("BOT_STAND_INS") or "off").strip().lower() in ("on", "1", "true", "yes")
+
 
 # The strongest controlled result Metaculus has published: eight pairs of bots
 # differing only in reasoning effort, and the higher-effort one won all eight
@@ -932,9 +947,10 @@ def resolve_models(count: int = 3) -> list[str]:
     vendors: the bot-maker surveys found ensembling across comparably strong
     model families worth far more than which single model is best.
     """
-    global PRIMARY_PROVIDER
+    global PRIMARY_PROVIDER, TIERED
     FALLBACK_ONLY.clear()
     PRIMARY_PROVIDER = None
+    TIERED = False
     override = os.environ.get("BOT_MODELS", "").strip()
     if override:
         return [m.strip() for m in override.split(",") if m.strip()]
@@ -948,7 +964,7 @@ def resolve_models(count: int = 3) -> list[str]:
         primaries = [f"gemini/{m}" for m in primary_flash_models(provider_catalogue(gemini))]
         if len(primaries) >= 2:
             fallbacks = []
-            for name in FALLBACK_PROVIDER_ORDER:
+            for name in FALLBACK_PROVIDER_ORDER if STAND_INS_ENABLED else ():
                 prov = PROVIDERS[name]
                 if prov.key:
                     mid = fallback_model(prov)
@@ -956,6 +972,7 @@ def resolve_models(count: int = 3) -> list[str]:
                         fallbacks.append(mid)
             FALLBACK_ONLY.update(fallbacks)
             PRIMARY_PROVIDER = "gemini"
+            TIERED = True
             return primaries + fallbacks
         log.warning("fewer than two Gemini Flash models at %.1f or newer; mixing providers",
                     PRIMARY_GEMINI_MIN_VERSION)
