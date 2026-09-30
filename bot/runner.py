@@ -29,13 +29,22 @@ from .client import (
     already_forecast,
     sub_questions,
 )
-from .forecast import CONTINUOUS_TYPES, build_context, forecast_question, search_queries
+from .forecast import (
+    CONTINUOUS_TYPES,
+    EnsembleTooThin,
+    build_context,
+    forecast_question,
+    search_queries,
+)
 from .llm import (
     DEAD_MODELS,
+    EXHAUSTED_UNTIL,
+    FALLBACK_ONLY,
     USAGE,
     LLMError,
     NoModelsAvailable,
     metaculus_proxy_models,
+    probe,
     provider_is_metered,
     resolve_models,
 )
@@ -87,8 +96,16 @@ def _seen_before(client: MetaculusClient, post: dict, question: dict) -> bool:
     return False
 
 
-def collect_targets(client: MetaculusClient, tournaments: list[str]) -> list[tuple[dict, dict]]:
-    """Open questions in these tournaments that the bot has not forecast yet."""
+def collect_targets(
+    client: MetaculusClient, tournaments: list[str], include_forecast: bool = False
+) -> list[tuple[dict, dict]]:
+    """Open questions in these tournaments that the bot has not forecast yet.
+
+    ``include_forecast`` also returns questions already forecast. It exists for
+    dry runs in the bot testing area, where nothing is submitted and Metaculus
+    encourages resubmission, so the whole pipeline can be exercised on the same
+    handful of test questions. It is never used against a tournament.
+    """
     targets: list[tuple[dict, dict]] = []
     seen: set[int] = set()
     for tournament in tournaments:
@@ -108,10 +125,29 @@ def collect_targets(client: MetaculusClient, tournaments: list[str]) -> list[tup
                 if qtype not in SUPPORTED:
                     log.info("skipping question %s: unsupported type %r", qid, qtype)
                     continue
-                if _seen_before(client, post, question):
+                if not include_forecast and _seen_before(client, post, question):
                     continue
                 targets.append((post, question))
     return targets
+
+
+# Research per question for the life of the watcher. A question that waits
+# for more strong answers is polled again every few minutes, and repeating the
+# search each time would spend the finite AskNews allowance for nothing.
+_RESEARCH: dict[int, tuple[str, list[str]]] = {}
+
+
+def _research(ctx: dict, models: list[str]) -> tuple[str, list[str]]:
+    qid = ctx["question_id"]
+    if qid in _RESEARCH:
+        return _RESEARCH[qid]
+    queries = search_queries(ctx, models)
+    report = research_mod.gather(queries, ctx=ctx)
+    log.info("q%s evidence: %s", qid, report.source_mix)
+    if report.errors:
+        log.warning("q%s research issues: %s", qid, "; ".join(report.errors)[:300])
+    _RESEARCH[qid] = (report.render(), report.source_names)
+    return _RESEARCH[qid]
 
 
 def handle_one(client: MetaculusClient, post: dict, question: dict, models: list[str], runs: int) -> str:
@@ -119,17 +155,13 @@ def handle_one(client: MetaculusClient, post: dict, question: dict, models: list
     qid = ctx["question_id"]
     title = ctx["title"][:90]
 
-    queries = search_queries(ctx, models)
-    report = research_mod.gather(queries, ctx=ctx)
-    log.info("q%s evidence: %s", qid, report.source_mix)
-    if report.errors:
-        log.warning("q%s research issues: %s", qid, "; ".join(report.errors)[:300])
+    research_text, research_sources = _research(ctx, models)
 
     forecast = forecast_question(
         post=post,
         question=question,
-        research_text=report.render(),
-        research_sources=report.source_names,
+        research_text=research_text,
+        research_sources=research_sources,
         models=models,
         runs=runs,
     )
@@ -143,13 +175,38 @@ def handle_one(client: MetaculusClient, post: dict, question: dict, models: list
         log.error("q%s forecast submitted but comment FAILED: %s", qid, exc)
 
     log.info("q%s %-14s %s | %s", qid, forecast.question_type, forecast.headline, title)
+    log.info("q%s answered by %s", qid, ", ".join(forecast.models_used) or "nobody")
     for note in forecast.notes:
-        log.debug("  q%s: %s", qid, note)
+        log.info("  q%s: %s", qid, note)
+    if client.dry_run:
+        log.info("q%s dry run payload: %s", qid, _payload_summary(forecast.payload))
+        log.info("q%s dry run comment (%d chars):\n%s", qid, len(forecast.comment), forecast.comment[:1500])
+    _RESEARCH.pop(qid, None)
     return forecast.headline
 
 
-def run_tick(client: MetaculusClient, tournaments: list[str], models: list[str], runs: int, limit: int) -> int:
-    targets = collect_targets(client, tournaments)
+def _payload_summary(payload: dict) -> str:
+    """What would go on the wire, short enough for one log line."""
+    if "probability_yes" in payload:
+        return f"probability_yes={payload['probability_yes']}"
+    if "probability_yes_per_category" in payload:
+        cats = payload["probability_yes_per_category"]
+        return f"categories={cats} sum={sum(cats.values()):.6f}"
+    cdf = payload.get("continuous_cdf") or []
+    if cdf:
+        return f"cdf {len(cdf)} points, first {cdf[0]:.5f}, last {cdf[-1]:.5f}"
+    return str(payload)[:200]
+
+
+def run_tick(
+    client: MetaculusClient,
+    tournaments: list[str],
+    models: list[str],
+    runs: int,
+    limit: int,
+    include_forecast: bool = False,
+) -> int:
+    targets = collect_targets(client, tournaments, include_forecast=include_forecast)
     if not targets:
         log.info("nothing new to forecast")
         return 0
@@ -161,6 +218,7 @@ def run_tick(client: MetaculusClient, tournaments: list[str], models: list[str],
     log.info("forecasting %d question(s) with %s", len(targets), ", ".join(models))
     done = 0
     outage = 0
+    waiting = 0
     with cf.ThreadPoolExecutor(max_workers=config.QUESTION_WORKERS) as pool:
         futures = {
             pool.submit(handle_one, client, post, question, models, runs): question.get("id")
@@ -171,6 +229,10 @@ def run_tick(client: MetaculusClient, tournaments: list[str], models: list[str],
             try:
                 fut.result()
                 done += 1
+            except EnsembleTooThin as exc:
+                # Not a failure: the question waits for more strong answers.
+                waiting += 1
+                log.info("q%s waiting: %s", qid, str(exc)[:200])
             except NoModelsAvailable as exc:
                 outage += 1
                 log.error("q%s skipped, no model available: %s", qid, str(exc)[:300])
@@ -178,15 +240,19 @@ def run_tick(client: MetaculusClient, tournaments: list[str], models: list[str],
                 log.error("q%s failed: %s", qid, str(exc)[:400])
             except Exception:  # noqa: BLE001 - one bad question must not end the tick
                 log.error("q%s crashed:\n%s", qid, traceback.format_exc()[:1500])
+    if waiting:
+        log.info("%d question(s) waiting for more strong-model answers", waiting)
     if outage:
         # Grinding through the rest of the list would be hundreds of doomed
         # requests against a shared proxy. The questions are untouched and the
         # next poll picks them up.
         log.error(
             "%d question(s) skipped because no model was reachable. Dead models: %s. "
+            "Out for the day: %s. "
             "Nothing was submitted for them, so they will be retried next run.",
             outage,
             ", ".join(sorted(DEAD_MODELS)) or "none recorded",
+            ", ".join(sorted(EXHAUSTED_UNTIL)) or "none",
         )
     return done
 
@@ -250,16 +316,31 @@ def main(argv: list[str] | None = None) -> int:
     models = resolve_models(config.ENSEMBLE_MODELS)
     runs = args.runs
     if provider_is_metered() and runs == config.RUNS_PER_QUESTION:
-        runs = config.RUNS_PER_QUESTION_METERED
+        runs = config.RUNS_PER_QUESTION_METERED if FALLBACK_ONLY else config.RUNS_PER_QUESTION_UNTIERED
         log.info("provider is rate limited, using %d runs per question", runs)
-    log.info("ensemble: %s", ", ".join(models))
+    strong = [m for m in models if m not in FALLBACK_ONLY]
+    log.info("ensemble: %s", ", ".join(strong))
+    if FALLBACK_ONLY:
+        log.info("stand-ins, used only near the deadline: %s", ", ".join(m for m in models if m in FALLBACK_ONLY))
+
+    # A dry run in the bot testing area re-forecasts questions the bot has
+    # already answered there, since nothing is submitted; anywhere else a dry
+    # run still skips them. And it looks at a handful, because it spends the
+    # same free allowances the live watcher needs.
+    include_forecast = bool(args.dry_run and args.mode == "test" and not args.tournament)
+    limit = args.limit
+    if args.dry_run and limit == config.MAX_QUESTIONS_PER_TICK:
+        limit = config.DRY_RUN_LIMIT
+    if args.dry_run:
+        for model, outcome in probe(models).items():
+            log.info("probe %s: %s", model, outcome)
 
     deadline = time.monotonic() + args.watch if args.watch else None
     total = 0
     while True:
         started = time.monotonic()
         try:
-            total += run_tick(client, tournaments, models, runs, args.limit)
+            total += run_tick(client, tournaments, models, runs, limit, include_forecast)
         except Exception:  # noqa: BLE001 - a watch loop must outlive one bad tick
             log.error("tick crashed:\n%s", traceback.format_exc()[:2000])
 

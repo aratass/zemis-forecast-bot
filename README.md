@@ -36,22 +36,37 @@ Being clever comes third.
    every free source is queried in parallel: AskNews if a key is present,
    GDELT, Wikipedia, and the open odds on Polymarket and Manifold. Sources fail
    independently; a dead endpoint costs a log line, never the forecast.
-3. **Ensemble.** Five runs across three model families, rotating which family
-   leads. The prompt asks for the status quo outcome, an explicit base rate and
-   reference class, what the evidence establishes, the case each way, and how
-   much can change in the time left. It does not use multi-persona or
-   "think like a Bayesian" framing, both of which measured worse than plain
-   reasoning in published evaluations.
+3. **Ensemble.** On free keys, four runs, one led by each of the newest
+   Gemini Flash versions the key can see (3.5 and newer), with every run
+   falling through the other Flash versions before anything else. Other free
+   models (OpenRouter's free Nemotron 3 Ultra, GitHub Models' GPT-4.1, Groq's
+   gpt-oss-120b, in that order) only stand in, and only when the question is
+   within 30 minutes of closing and fewer than two Flash answers are in. Until
+   then the question waits for the next poll and keeps the answers it has.
+   The reason is measured: Metaculus's FutureEval model leaderboard scores
+   Gemini 3.5 Flash at +12.17 and 3.6 Flash at +13.22 against GPT-4o, and
+   gpt-oss-120b at -0.26, and from 21 to 30 September 63 of the 68 answers
+   behind this bot's tournament forecasts came from gpt-oss-120b because the
+   single Gemini member kept answering 429 or 503. With sponsored credits the
+   old design applies: runs across three model families. The prompt asks for
+   the status quo outcome, an explicit base rate and reference class, what the
+   evidence establishes, the case each way, and how much can change in the
+   time left. It does not use multi-persona or "think like a Bayesian"
+   framing, both of which measured worse than plain reasoning in published
+   evaluations.
 4. **Aggregate.** Median, not mean, so one hallucinated number cannot move the
-   answer. Numeric questions take the median percentile by percentile.
+   answer. Numeric questions take the median percentile by percentile. When
+   there are enough Flash answers, stand-in answers are left out of the median
+   altogether.
 5. **Calibrate.** Binary probabilities are shrunk toward even odds in log-odds
    space and then capped at 5% and 95%. Numeric distributions are widened, given
    explicit tails, and mixed with a uniform. Multiple choice is mixed toward the
    uniform, because it is the question type where bots lose most heavily to
    human professionals.
 6. **Submit**, then comment. The comment records the models, the sources, the
-   individual ensemble values and the calibration applied, which is both the
-   eligibility requirement and the run log.
+   individual ensemble values, the calibration applied, and the reasoning of
+   the run nearest the median (the rules ask for comments "so everyone can see
+   their reasoning"; Metaculus makes them public when the question closes).
 
 ## The parts worth reviewing
 
@@ -87,6 +102,7 @@ python -m pytest tests/ -q
 
 python -m bot.runner --check-sources          # which sources answer, which models resolved
 python -m bot.runner --mode test              # the unscored bot testing area
+python -m bot.runner --mode test --dry-run      # re-forecasts the testing area, submits nothing
 python -m bot.runner --mode tournament --dry-run
 python -m bot.runner --mode tournament        # live
 ```
@@ -103,9 +119,13 @@ things if present:
 | secret | what it buys |
 | --- | --- |
 | `METACULUS_TOKEN` | required: reading questions, submitting, commenting |
-| `OPENROUTER_API_KEY` | the sponsored tournament credits from OpenAI, Anthropic and Google |
-| `ASKNEWS_CLIENT_ID`, `ASKNEWS_SECRET` | 1,000 free news calls a month via the Metaculus partnership |
-| `GEMINI_API_KEY`, `GROQ_API_KEY` | free-tier fallbacks if the credits run out mid-season |
+| `GEMINI_API_KEY` | the ensemble on free keys: every Gemini Flash version from 3.5 up |
+| `OPENROUTER_API_KEY` | a free key buys the free Nemotron 3 Ultra stand-in (`OPENROUTER_FREE_ONLY=0` for sponsored credits) |
+| `GROQ_API_KEY` | gpt-oss-120b, the last stand-in |
+| `ASKNEWS_CLIENT_ID`, `ASKNEWS_SECRET` | news search via the Metaculus partnership |
+
+GitHub Models' GPT-4.1 stand-in needs no secret: the workflow passes its own
+`GITHUB_TOKEN` as `GITHUB_MODELS_TOKEN` when it grants `models: read`.
 
 No secret is ever logged; the client scrubs the token out of exception text
 before printing it.
@@ -117,6 +137,10 @@ before printing it.
 | `SEASONAL_TOURNAMENT` | `fall-futureeval-2026` | a slug, so it survives renumbering |
 | `MINIBENCH_TOURNAMENT` | `minibench` | |
 | `RUNS_PER_QUESTION` | 5 | winners averaged about 28 LLM calls per question |
+| `RUNS_PER_QUESTION_METERED` | 4 | on free keys: one run led by each Flash version |
+| `MIN_STRONG_ANSWERS` | 2 | Flash answers needed before a forecast goes out early |
+| `DEFER_MARGIN_MINUTES` | 30 | inside this, stand-ins are used rather than nothing |
+| `PRIMARY_GEMINI_MIN_VERSION` | 3.5 | oldest Flash version allowed in the ensemble |
 | `ENSEMBLE_MODELS` | 3 | one per model family |
 | `BOT_MODELS` | unset | comma separated, pins models instead of resolving them |
 | `MAX_QUESTIONS_PER_TICK` | 25 | a tick must finish well inside the three hour window |
@@ -150,7 +174,11 @@ unresolved, and runs a fresh round every two weeks.
 - It forecasts each question once. It does not re-run a question because the
   answer looked wrong.
 - Development and testing happen on resolved questions, the bot testing area,
-  or the main site, never on open tournament questions.
+  or the main site, never on open tournament questions. A dry run only
+  re-forecasts questions it has already answered when it is pointed at the
+  bot testing area; in tournament mode it skips them like a live run.
+- A question that waits for more Flash answers is not re-run because of what
+  it said: nothing has been submitted, and the answers already in are kept.
 - Prediction market odds are used, which the rules explicitly permit: a bot
   "may use any resources that are generally available to human forecasters.
   This includes using publicly available forecasts on questions found on other

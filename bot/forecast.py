@@ -11,15 +11,17 @@ import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
-from . import aggregate, parsing, prompts
+from . import aggregate, config, parsing, prompts
 from .cdf import DEFAULT_INBOUND_OUTCOME_COUNT, build_cdf, percentiles_from_cdf, safe_cdf
 from .llm import (
+    FALLBACK_ONLY,
     LLMError,
     NoModelsAvailable,
     chat_with_fallback,
     extract_json,
+    model_available,
     provider_is_metered,
     run_parallel,
 )
@@ -28,6 +30,22 @@ from .scaling import Scaling
 log = logging.getLogger(__name__)
 
 CONTINUOUS_TYPES = {"numeric", "discrete", "date"}
+
+
+class EnsembleTooThin(LLMError):
+    """Too few strong-model answers, and the question is open long enough to wait.
+
+    Nothing is submitted. The answers already in are kept for this process, so
+    the next poll only asks for the missing ones.
+    """
+
+
+# Strong-model answers per (question id, question type), kept for the life of
+# the watcher so a question that waits does not pay for its answers twice.
+_STRONG_ANSWERS: dict[tuple, list[tuple[str, str]]] = {}
+
+# How much of one run's reasoning goes into the comment.
+COMMENT_REASONING_CHARS = 3500
 
 
 @dataclass
@@ -91,6 +109,7 @@ def build_context(post: dict, question: dict) -> dict:
     ctx: dict[str, Any] = {
         "post_id": post.get("id"),
         "question_id": question.get("id"),
+        "close_dt": close,
         "type": qtype,
         "title": question.get("title") or post.get("title") or "",
         "description": (question.get("description") or "")[:6000],
@@ -155,46 +174,141 @@ def search_queries(ctx: dict, models: Sequence[str]) -> list[str]:
 
 
 # -- per-type pipelines ----------------------------------------------------
-def _run_ensemble(messages, models: Sequence[str], runs: int, temperature: float) -> list[tuple[str, str]]:
-    """Fire ``runs`` calls, rotating across model families for diversity."""
+def can_defer(ctx: dict, now: datetime | None = None) -> bool:
+    """May this question wait for the next poll?
+
+    Only when the ensemble has stand-ins behind its strong models (otherwise
+    there is nothing better to wait for), and only while the question stays
+    open for longer than the safety margin.
+    """
+    if not FALLBACK_ONLY:
+        return False
+    close = ctx.get("close_dt")
+    if close is None:
+        return False
+    now = now or datetime.now(timezone.utc)
+    return (close - now).total_seconds() > config.DEFER_MARGIN_MINUTES * 60
+
+
+def _run_ensemble(
+    messages,
+    models: Sequence[str],
+    runs: int,
+    temperature: float,
+    cache_key: tuple | None = None,
+    allow_fallback: bool = True,
+    usable: Callable[[str], bool] | None = None,
+) -> list[tuple[str, str]]:
+    """Collect ``runs`` answers, each run led by a different strong model.
+
+    Every run tries the strong models first, starting from a different one each
+    time, and only then the stand-ins, and those only when ``allow_fallback``.
+    Usable strong answers from an earlier poll of the same question count
+    towards ``runs``; an unusable one is not kept, or it would fill a slot
+    forever without ever counting as an answer.
+    """
+    primaries = [m for m in models if m not in FALLBACK_ONLY]
+    fallbacks = [m for m in models if m in FALLBACK_ONLY]
+    if not primaries:
+        primaries, fallbacks = list(models), []
+    tail = fallbacks if allow_fallback else []
+
+    cached = list(_STRONG_ANSWERS.get(cache_key, [])) if cache_key else []
     tasks = []
-    for i in range(runs):
-        ordered = list(models[i % len(models):]) + list(models[: i % len(models)])
-        tasks.append(lambda o=ordered: chat_with_fallback(messages, o, temperature=temperature))
+    for i in range(len(cached), runs):
+        k = i % len(primaries)
+        ordered = primaries[k:] + primaries[:k] + tail
+        tasks.append(
+            lambda o=ordered: chat_with_fallback(
+                messages, o, temperature=temperature, attempts=config.ENSEMBLE_ATTEMPTS
+            )
+        )
     out: list[tuple[str, str]] = []
     dead = 0
-    for result in run_parallel(tasks, workers=min(runs, 5)):
+    for result in run_parallel(tasks, workers=min(max(len(tasks), 1), 5)):
         if isinstance(result, Exception):
             if isinstance(result, NoModelsAvailable):
                 dead += 1
             log.warning("ensemble member failed: %s", str(result)[:200])
             continue
         out.append(result)
-    if not out and dead:
+    if cache_key is not None:
+        _STRONG_ANSWERS.setdefault(cache_key, []).extend(
+            r for r in out if r[1] not in FALLBACK_ONLY and (usable is None or usable(r[0]))
+        )
+    combined = cached + out
+    if not combined and dead:
+        if not allow_fallback and any(model_available(m) for m in fallbacks):
+            raise EnsembleTooThin("no strong model can answer right now; waiting for the next poll")
         # Nothing answered at all. That is the LLM layer being down, not the
         # models being unsure, and the two must not be confused: see the callers.
         raise NoModelsAvailable(
             f"all {runs} ensemble members failed because every model is unavailable"
         )
-    return out
+    return combined
 
 
-def forecast_binary(ctx: dict, research: str, models: Sequence[str], runs: int) -> tuple[dict, str, list[str], int, list[str]]:
-    results = _run_ensemble(prompts.binary_prompt(ctx, research), models, runs, 0.4)
+def _choose(ctx: dict, parsed: list, runs: int, deferrable: bool, notes: list[str]) -> list:
+    """Keep the answers worth aggregating: strong ones, or all of them at the deadline.
+
+    ``parsed`` holds (value, text, model) triples. With enough strong answers the
+    stand-ins are left out entirely, because a median of two strong answers and
+    two much weaker ones is half the weaker model.
+    """
+    if not FALLBACK_ONLY:
+        return parsed
+    strong = [p for p in parsed if p[2] not in FALLBACK_ONLY]
+    needed = max(1, min(config.MIN_STRONG_ANSWERS, runs))
+    if len(strong) >= needed:
+        dropped = len(parsed) - len(strong)
+        if dropped:
+            notes.append(f"{dropped} stand-in answer(s) left out; {len(strong)} strong answers")
+        return strong
+    if deferrable:
+        raise EnsembleTooThin(
+            f"{len(strong)} of {needed} strong answers so far; waiting for the next poll"
+        )
+    if parsed:
+        notes.append(
+            f"only {len(strong)} strong answer(s) before the deadline; stand-ins included"
+        )
+    return parsed
+
+
+def _reasoning_excerpt(text: str, limit: int = COMMENT_REASONING_CHARS) -> str:
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    head = limit - 800
+    return text[:head].rstrip() + "\n[...]\n" + text[-700:].lstrip()
+
+
+def forecast_binary(ctx: dict, research: str, models: Sequence[str], runs: int):
+    deferrable = can_defer(ctx)
+    results = _run_ensemble(
+        prompts.binary_prompt(ctx, research),
+        models,
+        runs,
+        0.4,
+        cache_key=(ctx["question_id"], "binary"),
+        allow_fallback=not deferrable,
+        usable=lambda text: parsing.parse_probability(text) is not None,
+    )
     notes: list[str] = []
-    probs, texts, used = [], [], []
+    parsed = []
     for text, model in results:
         p = parsing.parse_probability(text)
         if p is None:
             notes.append(f"{model}: no probability found")
             continue
-        probs.append(p)
-        texts.append(text)
-        used.append(model)
+        parsed.append((p, text, model))
+    parsed = _choose(ctx, parsed, runs, deferrable, notes)
 
-    if not probs:
+    if not parsed:
         raise LLMError("no ensemble member produced a usable probability")
 
+    probs = [p for p, _, _ in parsed]
+    used = [m for _, _, m in parsed]
     raw = aggregate.aggregate_binary(probs)
     disagreement = aggregate.spread(probs)
     final = aggregate.calibrate_binary(raw)
@@ -202,6 +316,8 @@ def forecast_binary(ctx: dict, research: str, models: Sequence[str], runs: int) 
         f"ensemble {[round(p, 3) for p in probs]} -> median {raw:.3f} -> calibrated {final:.3f} "
         f"(spread {disagreement:.3f})"
     )
+    # The run nearest the median speaks for the ensemble in the comment.
+    reasoning = min(parsed, key=lambda item: abs(item[0] - raw))[1]
     headline = f"{final:.1%}"
     return (
         {"question": ctx["question_id"], "probability_yes": round(final, 6)},
@@ -209,14 +325,24 @@ def forecast_binary(ctx: dict, research: str, models: Sequence[str], runs: int) 
         notes,
         len(probs),
         used,
+        reasoning,
     )
 
 
 def forecast_numeric(ctx: dict, research: str, models: Sequence[str], runs: int):
     is_date = ctx["type"] == "date"
-    results = _run_ensemble(prompts.numeric_prompt(ctx, research), models, runs, 0.4)
+    deferrable = can_defer(ctx)
+    results = _run_ensemble(
+        prompts.numeric_prompt(ctx, research),
+        models,
+        runs,
+        0.4,
+        cache_key=(ctx["question_id"], ctx["type"]),
+        allow_fallback=not deferrable,
+        usable=lambda text: len(parsing.parse_percentiles(text)) >= 2,
+    )
     notes: list[str] = []
-    parsed_runs, used = [], []
+    parsed = []
     for text, model in results:
         points = parsing.parse_percentiles(text)
         if is_date:
@@ -229,18 +355,20 @@ def forecast_numeric(ctx: dict, research: str, models: Sequence[str], runs: int)
         if len(points) < 2:
             notes.append(f"{model}: no usable percentiles")
             continue
-        parsed_runs.append(points)
-        used.append(model)
+        parsed.append((points, text, model))
 
     scaling: Scaling = ctx["scaling"]
     count = ctx["inbound_outcome_count"]
-    if not parsed_runs and not results:
+    if not parsed and not results:
         # Submitting a uniform here would be the worst of both worlds: it scores
         # badly AND marks the question as forecast, so the bot never returns to
         # it once the outage clears. Fail instead, and let the next poll retry.
         raise NoModelsAvailable(
             "no ensemble member responded; refusing to submit a placeholder distribution"
         )
+    parsed = _choose(ctx, parsed, runs, deferrable, notes)
+    parsed_runs = [points for points, _, _ in parsed]
+    used = [m for _, _, m in parsed]
     if not parsed_runs:
         notes.append("models responded but no usable percentiles; submitting a uniform distribution")
         cdf = safe_cdf(count, ctx["open_lower_bound"], ctx["open_upper_bound"])
@@ -250,6 +378,7 @@ def forecast_numeric(ctx: dict, research: str, models: Sequence[str], runs: int)
             notes,
             0,
             used,
+            "",
         )
 
     merged = aggregate.aggregate_percentiles(parsed_runs)
@@ -280,6 +409,7 @@ def forecast_numeric(ctx: dict, research: str, models: Sequence[str], runs: int)
         notes,
         len(parsed_runs),
         used,
+        parsed[0][1],
     )
 
 
@@ -293,21 +423,32 @@ def _looks_like_epoch(v: Any) -> bool:
 
 def forecast_multiple_choice(ctx: dict, research: str, models: Sequence[str], runs: int):
     options = ctx["options"]
-    results = _run_ensemble(prompts.multiple_choice_prompt(ctx, research), models, runs, 0.4)
+    deferrable = can_defer(ctx)
+    results = _run_ensemble(
+        prompts.multiple_choice_prompt(ctx, research),
+        models,
+        runs,
+        0.4,
+        cache_key=(ctx["question_id"], "multiple_choice"),
+        allow_fallback=not deferrable,
+        usable=lambda text: bool(parsing.parse_multiple_choice(text, options)),
+    )
     notes: list[str] = []
-    parsed_runs, used = [], []
+    parsed = []
     for text, model in results:
         got = parsing.parse_multiple_choice(text, options)
         if not got:
             notes.append(f"{model}: no usable option probabilities")
             continue
-        parsed_runs.append(got)
-        used.append(model)
+        parsed.append((got, text, model))
 
-    if not parsed_runs and not results:
+    if not parsed and not results:
         raise NoModelsAvailable(
             "no ensemble member responded; refusing to submit a placeholder distribution"
         )
+    parsed = _choose(ctx, parsed, runs, deferrable, notes)
+    parsed_runs = [got for got, _, _ in parsed]
+    used = [m for _, _, m in parsed]
     merged = aggregate.aggregate_multiple_choice(parsed_runs, options)
     if merged is None:
         notes.append("models responded but no usable option probabilities; using the uniform")
@@ -325,6 +466,7 @@ def forecast_multiple_choice(ctx: dict, research: str, models: Sequence[str], ru
         notes,
         len(parsed_runs),
         used,
+        parsed[0][1] if parsed else "",
     )
 
 
@@ -342,17 +484,22 @@ def forecast_question(
     qtype = ctx["type"]
 
     if qtype == "binary":
-        payload, headline, notes, n, used = forecast_binary(ctx, research_text, models, runs)
+        payload, headline, notes, n, used, reasoning = forecast_binary(ctx, research_text, models, runs)
         method = "median of ensemble, log-odds shrink then 5% cap"
     elif qtype in CONTINUOUS_TYPES:
-        payload, headline, notes, n, used = forecast_numeric(ctx, research_text, models, runs)
+        payload, headline, notes, n, used, reasoning = forecast_numeric(ctx, research_text, models, runs)
         method = "median percentile by percentile, widened, 5% uniform mix"
     elif qtype == "multiple_choice":
-        payload, headline, notes, n, used = forecast_multiple_choice(ctx, research_text, models, runs)
+        payload, headline, notes, n, used, reasoning = forecast_multiple_choice(
+            ctx, research_text, models, runs
+        )
         method = "median per option, mixed toward uniform"
     else:
         raise ValueError(f"unsupported question type {qtype!r} on question {ctx['question_id']}")
 
+    # The rules ask for comments "so everyone can see their reasoning", and they
+    # are made public when the question closes. Until this change the comment
+    # carried the numbers and "(not captured)" where the reasoning belonged.
     comment = prompts.SUMMARY_TEMPLATE.format(
         models=", ".join(sorted(set(used))) or ", ".join(models),
         sources=", ".join(research_sources) or "none reached",
@@ -360,7 +507,7 @@ def forecast_question(
         method=method,
         calibration="\n".join(f"- {note}" for note in notes),
         prediction_line=f"Forecast: {headline}",
-        reasoning=(sample_reasoning or "").strip()[:4000] or "(not captured)",
+        reasoning=_reasoning_excerpt(sample_reasoning or reasoning) or "(not captured)",
     )
 
     return Forecast(

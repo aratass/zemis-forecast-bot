@@ -36,3 +36,25 @@ def no_real_http(monkeypatch):
     monkeypatch.setattr(requests, "get", blocked)
     monkeypatch.setattr(requests, "post", blocked)
     monkeypatch.setattr(requests.Session, "request", blocked)
+
+
+@pytest.fixture(autouse=True)
+def fresh_model_state():
+    """Module-level model bookkeeping must not leak from one test into the next.
+
+    A test that resolves a tiered ensemble fills FALLBACK_ONLY, and a test that
+    forecasts question 101 leaves its answers in the per-question cache; either
+    would silently change what the next test sees.
+    """
+    from bot import forecast, llm
+
+    def clear():
+        llm.FALLBACK_ONLY.clear()
+        llm.EXHAUSTED_UNTIL.clear()
+        llm._COOLDOWN_UNTIL.clear()
+        llm.PRIMARY_PROVIDER = None
+        forecast._STRONG_ANSWERS.clear()
+
+    clear()
+    yield
+    clear()

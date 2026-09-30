@@ -53,7 +53,21 @@ PROVIDERS: dict[str, Provider] = {
         "gemini", "https://generativelanguage.googleapis.com/v1beta/openai", "GEMINI_API_KEY"
     ),
     "groq": Provider("groq", "https://api.groq.com/openai/v1", "GROQ_API_KEY"),
+    # GitHub Models, reached with the workflow's own GITHUB_TOKEN when the
+    # workflow grants "models: read". Free, but small: 50 requests a day on the
+    # "high" tier, at most 8,000 tokens in and 4,000 out per request.
+    "github": Provider("github", "https://models.github.ai/inference", "GITHUB_MODELS_TOKEN"),
 }
+
+# A free OpenRouter key buys the ":free" variants and nothing else; asking it
+# for a paid model returns 402. This bot runs at zero cost, so unless this is
+# switched off an OpenRouter key is treated as a free-tier key.
+OPENROUTER_FREE_ONLY = (os.environ.get("OPENROUTER_FREE_ONLY") or "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
 
 # Ordered preference patterns. Higher score wins; ties break on how recently the
 # model was published. Only vendors whose credits Metaculus sponsors are listed,
@@ -89,7 +103,47 @@ PROVIDER_LIMITS: dict[str, tuple[float, int]] = {
     "gemini": (10.0, 2),
     "groq": (25.0, 3),
     "metaculus": (20.0, 2),
+    "github": (10.0, 2),
 }
+
+# Free OpenRouter models are limited to 20 requests a minute.
+OPENROUTER_FREE_LIMITS: tuple[float, int] = (20.0, 1)
+
+
+def provider_limits(name: str) -> tuple[float, int]:
+    if name == "openrouter" and OPENROUTER_FREE_ONLY:
+        return OPENROUTER_FREE_LIMITS
+    return PROVIDER_LIMITS.get(name, (60.0, 4))
+
+
+# -- who forecasts, and who only stands in ---------------------------------
+# From 21 to 30 September the bot was, in practice, a gpt-oss-120b bot. The
+# watcher logs show 68 successful model calls in tournament mode, and 63 of
+# them came from Groq's gpt-oss-120b: the Gemini models answered 429 or 503
+# nearly every time, and the fallback order moved on to Groq after a minute.
+# Metaculus's own FutureEval model leaderboard (read 30 Sep 2026, head-to-head
+# peer score with GPT-4o at 0) puts GPT-OSS 120B at -0.26, Gemini 3.5 Flash at
+# +12.17 and Gemini 3.6 Flash at +13.22. The free Flash models are among the
+# best forecasters on that board; the free Groq model is not.
+#
+# So the ensemble is built from the Gemini Flash versions the key can see, and
+# every other model is a stand-in, asked only when no Flash model has answered
+# and the question is close to closing. Each Flash version has its own free
+# allowance and its own load, so spreading runs over several of them is also
+# what gets them answered.
+PRIMARY_MODELS = int(os.environ.get("PRIMARY_MODELS") or 4)
+PRIMARY_GEMINI_MIN_VERSION = float(os.environ.get("PRIMARY_GEMINI_MIN_VERSION") or 3.5)
+
+# Stand-ins in the order they are asked, strongest first by the same board:
+# Nemotron 3 Ultra +5.83 (OpenRouter free), GPT-4.1 +2.77 (GitHub Models),
+# GPT-OSS 120B -0.26 (Groq).
+FALLBACK_PROVIDER_ORDER = ("openrouter", "github", "groq")
+OPENROUTER_FREE_PREFERENCES = (r"^nvidia/nemotron-3-ultra[^:]*:free$",)
+GITHUB_MODELS_PREFERENCES = ("openai/gpt-4.1",)
+
+# Filled in by resolve_models. A model in this set is only ever asked after
+# every primary model in the same run has failed.
+FALLBACK_ONLY: set[str] = set()
 
 
 # The strongest controlled result Metaculus has published: eight pairs of bots
@@ -124,9 +178,17 @@ def _reasoning_params(prov: "Provider", limit_key: str) -> dict:
         return {}
     if limit_key in NO_REASONING:
         return {}
+    if prov.name == "github":
+        # GPT-4.1 is not a reasoning model, and the free tier caps output at
+        # 4,000 tokens, so there is no room for thinking anyway.
+        return {}
     if prov.name == "openrouter":
         return {"reasoning": {"effort": REASONING_EFFORT}}
     return {"reasoning_effort": REASONING_EFFORT}
+
+
+# GitHub Models' free tier refuses more than 4,000 output tokens per request.
+GITHUB_MAX_OUTPUT_TOKENS = 4000
 
 
 class _RateLimiter:
@@ -146,13 +208,13 @@ class _RateLimiter:
         provider = key.split("|", 1)[0]
         with self._lock:
             if key not in self._slots:
-                _, concurrency = PROVIDER_LIMITS.get(provider, (60.0, 4))
+                _, concurrency = provider_limits(provider)
                 self._slots[key] = threading.Semaphore(concurrency)
             return self._slots[key]
 
     def wait(self, key: str) -> None:
         provider = key.split("|", 1)[0]
-        rpm, _ = PROVIDER_LIMITS.get(provider, (60.0, 4))
+        rpm, _ = provider_limits(provider)
         spacing = 60.0 / max(rpm, 1.0)
         with self._lock:
             now = time.monotonic()
@@ -185,6 +247,81 @@ class NoModelsAvailable(LLMError):
 
 # Models that answered with an allowance or authentication error this process.
 DEAD_MODELS: set[str] = set()
+
+# Free-tier refusals come in two kinds that need opposite handling. A per-minute
+# limit clears in seconds, so wait briefly and try again. A daily allowance does
+# not clear until the provider's day rolls over, and every retry before then
+# wastes a request and a minute of a question that is open for about ninety.
+# Google names the quota in the error body; Groq names the limit ("tokens per
+# day (TPD)") and hands back a Retry-After of an hour or more.
+_DAILY_LIMIT = re.compile(r"(PerDay|per day|\(RPD\)|\(TPD\))", re.I)
+LONG_RETRY_SECONDS = 600.0
+RATE_LIMIT_MAX_SLEEP = 20.0
+
+# Models whose daily allowance is used up, and the wall-clock time it returns.
+EXHAUSTED_UNTIL: dict[str, float] = {}
+
+# A model that just answered 429 or 503 goes to the back of its tier for a
+# minute, so parallel runs try another Flash version first instead of queueing
+# behind the one that is overloaded. The watcher logs show why: the same Flash
+# model was retried three times per question, a minute apart, and lost.
+COOLDOWN_SECONDS = 60.0
+_COOLDOWN_UNTIL: dict[str, float] = {}
+
+# GitHub Models answers an over-long prompt with a 400 or 413. That is about the
+# prompt, not the model, so it must not write the model off.
+_PROMPT_TOO_LONG = re.compile(
+    r"(tokens_limit_reached|too large|too long|maximum context|context length)", re.I
+)
+
+
+def model_available(model: str, now: float | None = None) -> bool:
+    """False for a model that is dead, or out of its daily allowance until later."""
+    if model in DEAD_MODELS:
+        return False
+    until = EXHAUSTED_UNTIL.get(model)
+    return until is None or (now if now is not None else time.time()) >= until
+
+
+def _next_pacific_midnight(now: float | None = None) -> float:
+    """When Google's free daily allowances reset: midnight Pacific time."""
+    now = time.time() if now is None else now
+    try:
+        from datetime import datetime, timedelta
+        from zoneinfo import ZoneInfo
+
+        tz = ZoneInfo("America/Los_Angeles")
+        local = datetime.fromtimestamp(now, tz)
+        nxt = (local + timedelta(days=1)).replace(hour=0, minute=5, second=0, microsecond=0)
+        return nxt.timestamp()
+    except Exception:  # noqa: BLE001 - no tz database: assume an hour
+        return now + 3600.0
+
+
+def _error_brief(resp) -> str:
+    """A short, secret-free summary of a provider's error body, for the log.
+
+    The old log said only "HTTP 429", which could not tell a per-minute limit
+    from a used-up daily allowance, and those need opposite handling.
+    """
+    text = getattr(resp, "text", "") or ""
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return re.sub(r"\s+", " ", text)[:160]
+    if isinstance(data, list) and data:
+        data = data[0]
+    err = data.get("error") if isinstance(data, dict) else None
+    if not isinstance(err, dict):
+        return re.sub(r"\s+", " ", text)[:160]
+    parts = [str(err.get("status") or err.get("type") or err.get("code") or "")]
+    quotas = sorted(set(re.findall(r'"quotaId"\s*:\s*"([^"]+)"', text)))
+    if quotas:
+        parts.append("quota " + ",".join(quotas))
+    message = err.get("message")
+    if message:
+        parts.append(re.sub(r"\s+", " ", str(message))[:160])
+    return " | ".join(p for p in parts if p)
 
 
 @dataclass
@@ -261,7 +398,7 @@ def _adapt_model_name(prov: Provider, model: str) -> str:
     where the slash is part of the name and removing it produces a 404. Groq
     and OpenRouter ids go out exactly as their catalogues gave them.
     """
-    if prov.name in ("openrouter", "groq"):
+    if prov.name in ("openrouter", "groq", "github"):
         return model
     return model.split("/", 1)[1] if "/" in model else model
 
@@ -273,6 +410,7 @@ def chat(
     max_tokens: int = 3000,
     timeout: float = 240.0,
     attempts: int = 3,
+    reasoning: bool = True,
 ) -> str:
     prov, bare_model = _provider_for(model)
     key = prov.key
@@ -293,10 +431,12 @@ def chat(
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
-    reasoning = _reasoning_params(prov, limit_key)
-    if reasoning:
-        body.update(reasoning)
+    thinking = _reasoning_params(prov, limit_key) if reasoning else {}
+    if thinking:
+        body.update(thinking)
         body["max_tokens"] = max(max_tokens, REASONING_MAX_TOKENS)
+    if prov.name == "github":
+        body["max_tokens"] = min(body["max_tokens"], GITHUB_MAX_OUTPUT_TOKENS)
 
     last = None
     for attempt in range(1, attempts + 1):
@@ -315,20 +455,49 @@ def chat(
                 continue
 
         if resp.status_code == 429:
-            # Free tiers count per minute, so a few seconds of backoff just
-            # spends another request against the same exhausted window. Both
-            # the header and Google's error body say how long to wait; a run
-            # that ignored them spent 83 sleeps and still timed out.
-            delay = _retry_delay(resp) or 30.0 * attempt
-            last = f"HTTP 429, waited {delay:.0f}s"
-            log.info("%s rate limited, sleeping %.0fs", prov.name, delay)
-            time.sleep(min(delay, 90.0))
+            detail = _error_brief(resp)
+            delay = _retry_delay(resp)
+            if _DAILY_LIMIT.search(resp.text or "") or (
+                delay is not None and delay >= LONG_RETRY_SECONDS
+            ):
+                # Out for the day. Retrying before the reset only burns time.
+                if prov.name == "gemini":
+                    until = _next_pacific_midnight()
+                else:
+                    until = time.time() + (delay or 3600.0)
+                EXHAUSTED_UNTIL[model] = until
+                log.warning(
+                    "%s %s is out of its daily allowance until %s UTC (%s)",
+                    prov.name,
+                    bare_model,
+                    time.strftime("%Y-%m-%d %H:%M", time.gmtime(until)),
+                    detail,
+                )
+                raise ModelUnavailable(f"{prov.name} {bare_model} daily allowance used up: {detail}")
+            # A per-minute limit. Both the header and Google's error body say
+            # how long to wait; a run that ignored them spent 83 sleeps and
+            # still timed out. But the other Flash versions have their own
+            # allowances, so wait briefly, then let the caller move on.
+            wait = min(delay or 10.0 * attempt, RATE_LIMIT_MAX_SLEEP)
+            last = f"HTTP 429 ({detail})"
+            _COOLDOWN_UNTIL[model] = time.monotonic() + COOLDOWN_SECONDS
+            log.info("%s %s rate limited (%s)", prov.name, bare_model, detail)
+            if attempt < attempts:
+                time.sleep(wait)
             continue
 
         if resp.status_code in (500, 502, 503, 504):
-            last = f"HTTP {resp.status_code}"
-            time.sleep(min(2 ** attempt, 30))
+            detail = _error_brief(resp)
+            last = f"HTTP {resp.status_code} ({detail})"
+            _COOLDOWN_UNTIL[model] = time.monotonic() + COOLDOWN_SECONDS
+            log.info("%s %s -> HTTP %s (%s)", prov.name, bare_model, resp.status_code, detail)
+            if attempt < attempts:
+                time.sleep(min(5.0 * attempt, 20.0))
             continue
+        if resp.status_code in (400, 413) and _PROMPT_TOO_LONG.search(resp.text or ""):
+            raise LLMError(
+                f"{prov.name} {bare_model}: prompt too long for this model ({_error_brief(resp)})"
+            )
         if resp.status_code in (400, 401, 403, 404):
             # Do not bury a working model because it does not know one optional
             # parameter. Drop the parameter, remember that, and try again.
@@ -382,14 +551,23 @@ def chat_with_fallback(
     models: Sequence[str],
     **kwargs,
 ) -> tuple[str, str]:
-    """Try each model in turn. Returns (text, model_that_answered)."""
+    """Try each model in turn. Returns (text, model_that_answered).
+
+    Order is kept, with two adjustments. Dead models and models out of their
+    daily allowance are skipped. And a model that refused in the last minute
+    moves to the back of its own tier, never behind a stand-in: an overloaded
+    Flash model is still a better forecaster than the fallback.
+    """
     errors = []
-    live = [m for m in models if m not in DEAD_MODELS]
+    now = time.time()
+    live = [m for m in models if model_available(m, now)]
     if not live:
         raise NoModelsAvailable(
             "every model is unavailable with the current credentials: "
-            + ", ".join(sorted(DEAD_MODELS))
+            + ", ".join(sorted(set(DEAD_MODELS) | set(EXHAUSTED_UNTIL)))
         )
+    mono = time.monotonic()
+    live.sort(key=lambda m: (m in FALLBACK_ONLY, _COOLDOWN_UNTIL.get(m, 0.0) > mono))
     for model in live:
         try:
             return chat(messages, model, **kwargs), model
@@ -399,9 +577,34 @@ def chat_with_fallback(
         except LLMError as exc:
             errors.append(f"{model}: {exc}")
             log.warning("model %s failed, trying next: %s", model, str(exc)[:200])
-    if all(m in DEAD_MODELS for m in models):
+    if not any(model_available(m) for m in models):
         raise NoModelsAvailable("all models failed permanently:\n" + "\n".join(errors))
     raise LLMError("all models failed:\n" + "\n".join(errors))
+
+
+def probe(models: Sequence[str]) -> dict[str, str]:
+    """One tiny request per model: which ones answer right now, and how fast.
+
+    Run at the start of a dry run, so its log says model by model whether the
+    free allowances are answering before any forecast depends on them.
+    """
+    out: dict[str, str] = {}
+    for model in models:
+        started = time.monotonic()
+        try:
+            text = chat(
+                [{"role": "user", "content": "Reply with the word OK and nothing else."}],
+                model,
+                max_tokens=64,
+                attempts=1,
+                reasoning=False,
+            )
+            out[model] = f"answered in {time.monotonic() - started:.1f}s: {text.strip()[:20]!r}"
+        except ModelUnavailable as exc:
+            out[model] = f"unavailable: {str(exc)[:200]}"
+        except LLMError as exc:
+            out[model] = f"failed: {str(exc)[:200]}"
+    return out
 
 
 # -- model resolution ------------------------------------------------------
@@ -428,8 +631,15 @@ _LITE = re.compile(r"(lite|mini|nano|tiny|8b|instant)", re.I)
 _VERSION = re.compile(r"(\d+(?:\.\d+)?)")
 
 
+# Set by resolve_models when the ensemble is built from one provider's models
+# with stand-ins behind them; that provider's limits decide the run's pace.
+PRIMARY_PROVIDER: str | None = None
+
+
 def active_provider() -> Provider | None:
     """Whichever provider this run can actually reach, in preference order."""
+    if PRIMARY_PROVIDER and PROVIDERS[PRIMARY_PROVIDER].key:
+        return PROVIDERS[PRIMARY_PROVIDER]
     for name in ("openrouter", "gemini", "groq", "metaculus"):
         if PROVIDERS[name].key:
             return PROVIDERS[name]
@@ -444,7 +654,9 @@ def keyed_providers() -> list[Provider]:
     sponsored credits land it answers "you don\'t have an allowance" to every
     model, so it only joins the ensemble when nothing else is keyed.
     """
-    named = [PROVIDERS[n] for n in ("openrouter", "gemini", "groq") if PROVIDERS[n].key]
+    named = [
+        PROVIDERS[n] for n in ("openrouter", "gemini", "groq", "github") if PROVIDERS[n].key
+    ]
     if named:
         return named
     return [PROVIDERS["metaculus"]] if PROVIDERS["metaculus"].key else []
@@ -490,8 +702,13 @@ def _rank_bare(ids: Sequence[str]) -> list[str]:
         tier = 0.0 if _FLASH.search(mid) else 1.0
         if _LITE.search(mid):
             tier += 0.5
-        versions = [float(v) for v in _VERSION.findall(mid)] or [0.0]
-        return (tier, -max(versions), mid)
+        # For Gemini the version is the number after "gemini-". Taking the
+        # largest number anywhere in the id would rank a dated snapshot such
+        # as "-09-2025" above every real version.
+        version = gemini_version(mid)
+        if version is None:
+            version = max([float(v) for v in _VERSION.findall(mid)] or [0.0])
+        return (tier, -version, mid)
 
     usable = [m for m in ids if not _NOT_A_CHAT_MODEL.search(m)]
     return sorted(usable, key=score)
@@ -520,19 +737,106 @@ def _catalogue() -> list[dict]:
     return _CATALOGUE_CACHE
 
 
-def resolve_models(count: int = 3) -> list[str]:
-    """Pick ``count`` capable models from distinct vendors.
+_GEMINI_VERSION = re.compile(r"gemini-(\d+(?:\.\d+)?)", re.I)
+_NOT_PRIMARY = re.compile(r"(-exp|live|tts|image|audio|thinking|latest)", re.I)
 
-    Vendor diversity is the point: the bot-maker surveys found ensembling across
-    model families is worth far more than which single model is best, because
-    correlated errors are what sink an ensemble.
+
+def gemini_version(mid: str) -> float | None:
+    """3.8 for "models/gemini-3.8-flash"; None when the id carries no version."""
+    match = _GEMINI_VERSION.search(mid or "")
+    return float(match.group(1)) if match else None
+
+
+def is_primary_flash(mid: str) -> bool:
+    """A full Flash model at or above the version floor.
+
+    The floor is where the leaderboard evidence is: Gemini 3.5 Flash +12.17 and
+    3.6 Flash +13.22, while Gemini 3 Flash scored +6.39 and 2.5 Flash -8.07.
+    Lite variants score near zero (3.5 Flash-Lite +0.70). Aliases without a
+    version ("-latest") are skipped because they duplicate a pinned version.
     """
+    # Not _LITE here: "gemini" itself contains "mini".
+    if not _FLASH.search(mid) or re.search(r"lite", mid, re.I) or _NOT_PRIMARY.search(mid):
+        return False
+    if _NOT_A_CHAT_MODEL.search(mid):
+        return False
+    version = gemini_version(mid)
+    return version is not None and version >= PRIMARY_GEMINI_MIN_VERSION
+
+
+def primary_flash_models(ids: Sequence[str], limit: int = PRIMARY_MODELS) -> list[str]:
+    """Newest Flash versions first, one id per version."""
+    candidates = sorted(
+        (m for m in ids if is_primary_flash(m)),
+        key=lambda m: (-(gemini_version(m) or 0.0), len(m), m),
+    )
+    picked: list[str] = []
+    seen: set[float] = set()
+    for mid in candidates:
+        version = gemini_version(mid)
+        if version in seen:
+            continue
+        seen.add(version)
+        picked.append(mid)
+        if len(picked) >= limit:
+            break
+    return picked
+
+
+def fallback_model(prov: Provider) -> str | None:
+    """The one stand-in model worth asking on this provider, or None."""
+    if prov.name == "openrouter":
+        ids = [str(e.get("id") or "") for e in _catalogue()]
+        for pattern in OPENROUTER_FREE_PREFERENCES:
+            for mid in ids:
+                if re.search(pattern, mid):
+                    return f"openrouter/{mid}"
+        return None
+    if prov.name == "github":
+        return f"github/{GITHUB_MODELS_PREFERENCES[0]}"
+    ranked = _rank_bare(provider_catalogue(prov))
+    return f"{prov.name}/{ranked[0]}" if ranked else None
+
+
+def resolve_models(count: int = 3) -> list[str]:
+    """Pick the ensemble.
+
+    On free keys, the strong models are the Gemini Flash versions and every
+    other provider contributes one stand-in, listed after them and recorded in
+    FALLBACK_ONLY (see the comment above PRIMARY_MODELS for the evidence).
+    Otherwise, with sponsored credits, ``count`` capable models from distinct
+    vendors: the bot-maker surveys found ensembling across comparably strong
+    model families worth far more than which single model is best.
+    """
+    global PRIMARY_PROVIDER
+    FALLBACK_ONLY.clear()
+    PRIMARY_PROVIDER = None
     override = os.environ.get("BOT_MODELS", "").strip()
     if override:
         return [m.strip() for m in override.split(",") if m.strip()]
 
     keyed = keyed_providers()
-    if keyed and not any(p.name == "openrouter" for p in keyed):
+    free_keys = bool(keyed) and (
+        OPENROUTER_FREE_ONLY or not any(p.name == "openrouter" for p in keyed)
+    )
+    gemini = PROVIDERS["gemini"]
+    if free_keys and gemini.key:
+        primaries = [f"gemini/{m}" for m in primary_flash_models(provider_catalogue(gemini))]
+        if len(primaries) >= 2:
+            fallbacks = []
+            for name in FALLBACK_PROVIDER_ORDER:
+                prov = PROVIDERS[name]
+                if prov.key:
+                    mid = fallback_model(prov)
+                    if mid:
+                        fallbacks.append(mid)
+            FALLBACK_ONLY.update(fallbacks)
+            PRIMARY_PROVIDER = "gemini"
+            return primaries + fallbacks
+        log.warning("fewer than two Gemini Flash models at %.1f or newer; mixing providers",
+                    PRIMARY_GEMINI_MIN_VERSION)
+
+    if free_keys:
         # No OpenRouter key, so the ensemble comes from whichever providers we
         # do have. Ask each what it serves; hardcoding names is what produced
         # "You don\'t have an allowance for model <openai/gpt-5>".
@@ -545,6 +849,12 @@ def resolve_models(count: int = 3) -> list[str]:
         # good Groq key sat unused.
         served = {}
         for prov in keyed:
+            if prov.name in ("openrouter", "github"):
+                # Free keys here buy one specific model, not the catalogue.
+                mid = fallback_model(prov)
+                if mid:
+                    served[prov.name] = [mid.split("/", 1)[1]]
+                continue
             ranked = _rank_bare(provider_catalogue(prov))
             if ranked:
                 served[prov.name] = ranked
@@ -677,5 +987,5 @@ def provider_is_metered(threshold: float = 30.0) -> bool:
     prov = active_provider()
     if prov is None:
         return True
-    rpm, _ = PROVIDER_LIMITS.get(prov.name, (60.0, 4))
+    rpm, _ = provider_limits(prov.name)
     return rpm < threshold

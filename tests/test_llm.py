@@ -326,10 +326,15 @@ def test_the_stated_retry_delay_is_used():
 
 
 # -- ensembles across providers -------------------------------------------
-# A live watcher resolved three Gemini flash models while a working Groq key
-# sat unused, then spent most of its wall clock asleep on Gemini's 429s. Three
-# models on one free tier share one allowance, and they make correlated
-# mistakes, which is the thing ensembling is supposed to avoid.
+# The first design spread the ensemble across providers, one model each. The
+# watcher logs for 21 to 30 September show what that did on free keys: 63 of the
+# 68 answers that reached a tournament forecast came from Groq's gpt-oss-120b
+# (Metaculus FutureEval model leaderboard: -0.26), because the Gemini member
+# (Gemini 3.5 Flash +12.17, 3.6 Flash +13.22 on the same board) answered 429 or
+# 503 and the fallback moved on. Family diversity is worth having between
+# models of similar strength; between these two it hands the forecast to the
+# weaker one. So the Flash versions form the ensemble and other providers
+# stand in behind them.
 
 
 def _serve(monkeypatch, catalogues):
@@ -339,9 +344,10 @@ def _serve(monkeypatch, catalogues):
     )
 
 
-def test_the_ensemble_spreads_across_every_keyed_provider(monkeypatch):
+def test_flash_versions_lead_and_other_providers_stand_in(monkeypatch):
     monkeypatch.delenv("BOT_MODELS", raising=False)
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("GITHUB_MODELS_TOKEN", raising=False)
     monkeypatch.setenv("GEMINI_API_KEY", "g")
     monkeypatch.setenv("GROQ_API_KEY", "q")
     monkeypatch.setenv("METACULUS_TOKEN", "t")
@@ -349,13 +355,16 @@ def test_the_ensemble_spreads_across_every_keyed_provider(monkeypatch):
         monkeypatch,
         {
             "gemini": ["models/gemini-3.8-flash", "models/gemini-3.7-flash"],
-            "groq": ["llama-4-70b", "qwen-3-32b"],
+            "groq": ["openai/gpt-oss-120b", "qwen/qwen3.8-27b"],
         },
     )
     picked = llm.resolve_models(3)
-    providers = [m.split("/", 1)[0] for m in picked]
-    assert providers[:2] == ["gemini", "groq"], picked
-    assert len(set(providers)) == 2, picked
+    assert picked == [
+        "gemini/models/gemini-3.8-flash",
+        "gemini/models/gemini-3.7-flash",
+        "groq/openai/gpt-oss-120b",
+    ], picked
+    assert llm.FALLBACK_ONLY == {"groq/openai/gpt-oss-120b"}
     # The Metaculus token is always set, so it must not crowd out a real key.
     assert not any(m.startswith("metaculus/") for m in picked), picked
 
