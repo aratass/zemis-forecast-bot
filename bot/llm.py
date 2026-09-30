@@ -106,6 +106,23 @@ PROVIDER_LIMITS: dict[str, tuple[float, int]] = {
     "metaculus": (20.0, 2),
 }
 
+# Groq counts a request's prompt plus its max_tokens against the free
+# tier's tokens-per-minute limit, and refuses a request that alone exceeds it
+# ("Request too large ... tokens per minute"). The fourth dry run lost two
+# stand-in answers that way: a long evidence prompt plus 8,000 tokens of
+# reasoning room. So the room for the answer is fitted under the limit.
+TOKENS_PER_MINUTE_CAP: dict[str, int] = {"groq": 8000}
+MIN_ANSWER_ROOM = 1024
+
+
+def _fit_answer_room(prov_name: str, messages: Sequence[dict], wanted: int) -> int:
+    cap = TOKENS_PER_MINUTE_CAP.get(prov_name)
+    if not cap:
+        return wanted
+    prompt_tokens = int(sum(len(str(m.get("content") or "")) for m in messages) / 3.5) + 50
+    return max(MIN_ANSWER_ROOM, min(wanted, cap - prompt_tokens - 300))
+
+
 # Free OpenRouter models are limited to 20 requests a minute.
 OPENROUTER_FREE_LIMITS: tuple[float, int] = (20.0, 1)
 
@@ -486,6 +503,7 @@ def chat(
 
     last = None
     for attempt in range(1, attempts + 1):
+        body["max_tokens"] = _fit_answer_room(prov.name, messages, body["max_tokens"])
         with LIMITER.slot(limit_key):
             LIMITER.wait(limit_key)
             try:

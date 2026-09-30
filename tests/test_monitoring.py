@@ -489,3 +489,25 @@ def test_audit_only_writes_the_audit_and_the_ensemble_and_forecasts_nothing(monk
     assert audited == [True]
     (line,) = [c for c in _commands(capsys.readouterr().out) if "ensemble at start" in c]
     assert "gemini-3.8-flash" in line and "gpt-oss-120b" in line
+
+
+def test_a_groq_request_fits_under_its_tokens_per_minute_limit(monkeypatch):
+    sent = []
+
+    class R:
+        status_code, text, headers, ok = 200, "", {}, True
+
+        def json(self):
+            return {"choices": [{"message": {"content": "PROBABILITY: 20%"}, "finish_reason": "stop"}], "usage": {}}
+
+    monkeypatch.setattr(llm.requests, "post", lambda url, headers=None, json=None, timeout=None: sent.append(json) or R())
+    monkeypatch.setattr(llm.LIMITER, "wait", lambda key: None)
+    monkeypatch.setenv("GROQ_API_KEY", "q")
+    long_prompt = [{"role": "user", "content": "evidence " * 2500}]  # about 6,400 tokens
+    llm.chat(long_prompt, STAND_IN)
+    prompt_tokens = len(long_prompt[0]["content"]) / 3.5
+    assert sent[0]["max_tokens"] + prompt_tokens <= 8000
+    assert sent[0]["max_tokens"] >= llm.MIN_ANSWER_ROOM
+    monkeypatch.setenv("GEMINI_API_KEY", "g")
+    llm.chat(long_prompt, FLASH[0])
+    assert sent[1]["max_tokens"] == llm.REASONING_MAX_TOKENS, "only Groq is squeezed"
