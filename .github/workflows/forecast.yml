@@ -93,6 +93,7 @@ jobs:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
           ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
+          BOT_STAND_INS: ${{ vars.BOT_STAND_INS }}
         run: python -m bot.runner --audit-only --mode "${{ inputs.mode || 'tournament' }}"
       - name: forecast
         env:
@@ -107,6 +108,9 @@ jobs:
           # Repository variable, so reasoning effort can be turned down
           # without a deploy if it starts costing coverage. Empty means high.
           BOT_REASONING: ${{ vars.BOT_REASONING }}
+          # Repository variable. Empty or "off": only the Flash models
+          # forecast. "on": weaker free models may answer near the deadline.
+          BOT_STAND_INS: ${{ vars.BOT_STAND_INS }}
         run: |
           python -m bot.runner \
             --mode "${{ inputs.mode || 'tournament' }}" \
