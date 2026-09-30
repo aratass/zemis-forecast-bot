@@ -116,7 +116,7 @@ def test_with_too_few_flash_models_the_old_spread_is_kept(monkeypatch):
 
 
 def test_free_stand_ins_are_ordered_strongest_first(monkeypatch):
-    """Nemotron 3 Ultra +5.83, GPT-4.1 +2.77, GPT-OSS 120B -0.26."""
+    """Nemotron 3 Ultra +5.83, GPT-OSS 120B -0.26. GitHub Models is retired."""
     _keys(
         monkeypatch,
         GEMINI_API_KEY="g",
@@ -136,9 +136,9 @@ def test_free_stand_ins_are_ordered_strongest_first(monkeypatch):
     picked = llm.resolve_models(3)
     assert picked[2:] == [
         "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",
-        "github/openai/gpt-4.1",
         STAND_IN,
     ], picked
+    assert not any(m.startswith("github/") for m in picked), "GitHub Models was retired on 30 July 2026"
     assert "openai/gpt-6.1-sol" not in " ".join(picked), "a free key must never be sent to a paid model"
 
 
@@ -184,7 +184,6 @@ def wire(monkeypatch):
     monkeypatch.setattr(llm.LIMITER, "wait", lambda key: None)
     monkeypatch.setenv("GEMINI_API_KEY", "g")
     monkeypatch.setenv("GROQ_API_KEY", "q")
-    monkeypatch.setenv("GITHUB_MODELS_TOKEN", "h")
     llm.DEAD_MODELS.clear()
     llm.NO_REASONING.clear()
     yield sent, sleeps, queue
@@ -259,23 +258,13 @@ def test_a_model_that_just_refused_moves_behind_its_own_tier_not_behind_stand_in
     assert used in (FLASH[0], FLASH[1]), "an overloaded Flash model still beats the stand-in"
 
 
-def test_github_models_gets_its_own_limits(wire):
-    sent, sleeps, queue = wire
-    llm.chat([{"role": "user", "content": "x"}], "github/openai/gpt-4.1", max_tokens=3000)
-    body = sent[0]["body"]
-    assert sent[0]["url"].startswith("https://models.github.ai/inference")
-    assert body["model"] == "openai/gpt-4.1"
-    assert body["max_tokens"] <= 4000
-    assert "reasoning_effort" not in body and "reasoning" not in body
-
-
-def test_a_prompt_too_long_for_github_does_not_kill_the_model(wire):
+def test_a_prompt_too_long_does_not_kill_the_model(wire):
     sent, sleeps, queue = wire
     queue.append(Resp(413, '{"error":{"code":"tokens_limit_reached","message":"Request body too large"}}'))
     with pytest.raises(llm.LLMError) as err:
-        llm.chat([{"role": "user", "content": "x"}], "github/openai/gpt-4.1")
+        llm.chat([{"role": "user", "content": "x"}], STAND_IN)
     assert not isinstance(err.value, llm.ModelUnavailable)
-    assert "github/openai/gpt-4.1" not in llm.DEAD_MODELS
+    assert STAND_IN not in llm.DEAD_MODELS
 
 
 # -- the ensemble ---------------------------------------------------------------
@@ -360,7 +349,23 @@ def test_at_the_deadline_the_stand_in_is_used_rather_than_nothing(monkeypatch):
 
     forecast = _forecast(_question(q_binary, 10), monkeypatch, only_stand_in)
     assert forecast.models_used == [STAND_IN]
-    assert any("stand-ins included" in n for n in forecast.notes), forecast.notes
+    assert any("stand-ins used" in n for n in forecast.notes), forecast.notes
+
+
+def test_at_the_deadline_one_strong_answer_is_not_outvoted_by_stand_ins(monkeypatch):
+    llm.FALLBACK_ONLY.add(STAND_IN)
+    replies = iter(
+        [
+            ("PROBABILITY: 12%", FLASH[0]),
+            ("PROBABILITY: 70%", STAND_IN),
+            ("PROBABILITY: 72%", STAND_IN),
+            ("PROBABILITY: 75%", STAND_IN),
+        ]
+    )
+    forecast = _forecast(_question(q_binary, 10), monkeypatch, lambda m, models, **k: next(replies))
+    assert forecast.models_used == [FLASH[0]]
+    assert forecast.payload["probability_yes"] < 0.2
+    assert any("used alone" in n for n in forecast.notes), forecast.notes
 
 
 def test_with_enough_strong_answers_the_stand_ins_are_left_out(monkeypatch):

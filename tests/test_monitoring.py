@@ -301,7 +301,7 @@ def test_the_audit_never_raises():
 
 
 def test_the_catalogue_report_survives_dead_catalogues(monkeypatch):
-    for name in ("GEMINI_API_KEY", "GITHUB_MODELS_TOKEN", "GROQ_API_KEY"):
+    for name in ("GEMINI_API_KEY", "GROQ_API_KEY"):
         monkeypatch.setenv(name, "x")
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
 
@@ -310,9 +310,34 @@ def test_the_catalogue_report_survives_dead_catalogues(monkeypatch):
 
     monkeypatch.setattr(llm.requests, "get", refuse)
     lines = llm.catalogue_report()
-    assert lines[0] == "gemini flash ids: none listed"
-    assert lines[1].startswith("github models: catalogue unreadable")
-    assert lines[2] == "groq ids: none listed"
+    assert lines == ["gemini flash ids: none listed", "gemma ids: none listed", "groq ids: none listed"]
+
+
+def test_a_bare_answer_brings_its_separate_reasoning_into_the_comment(monkeypatch):
+    llm.FALLBACK_ONLY.add(STAND_IN)
+    bare = llm.Answer(REPLIES["binary"], "Base rate: most such bills stall in committee.")
+
+    monkeypatch.setattr(fc, "chat_with_fallback", lambda m, models, **k: (bare, STAND_IN))
+    forecast = fc.forecast_question(post=POST, question=_soon(q_binary, 10), research_text="",
+                                    research_sources=[], models=FLASH + [STAND_IN], runs=2)
+    assert "most such bills stall in committee" in forecast.comment
+
+
+def test_failures_are_counted_by_model_and_reason(monkeypatch):
+    class R:
+        status_code = 503
+        text = '{"error": {"code": 503, "status": "UNAVAILABLE", "message": "high demand"}}'
+        headers = {}
+        ok = False
+
+    monkeypatch.setattr(llm.requests, "post", lambda *a, **k: R())
+    monkeypatch.setattr(llm.LIMITER, "wait", lambda key: None)
+    monkeypatch.setattr(llm.time, "sleep", lambda s: None)
+    monkeypatch.setenv("GEMINI_API_KEY", "g")
+    llm.FAILURES.clear()
+    with pytest.raises(llm.LLMError):
+        llm.chat([{"role": "user", "content": "x"}], FLASH[0], attempts=2)
+    assert llm.failure_summary() == "gemini-3.8-flash HTTP 503 x2"
 
 
 def test_a_google_quota_error_names_the_limit():
@@ -323,3 +348,41 @@ def test_a_google_quota_error_names_the_limit():
 
     brief = llm._error_brief(R())
     assert "PerDay" in brief and "limit 20" in brief
+
+
+def test_a_dry_run_keeps_polling_while_questions_wait_and_never_repeats_one(monkeypatch, quiet_research):
+    from bot import config
+
+    posts = {"bot-testing-area": [_open_post(1, q_binary()), _open_post(2, dict(q_mc(), id=105))]}
+
+    class FakeMetaculus(Client):
+        def __init__(self, dry_run=False):
+            super().__init__(posts, dry_run=dry_run)
+
+    calls = []
+
+    def forecast_question(post, question, **kwargs):
+        calls.append(question["id"])
+        if question["id"] == 105 and calls.count(105) == 1:
+            raise EnsembleTooThin("1 of 2 strong answers so far")
+        if question["type"] == "binary":
+            payload = {"question": question["id"], "probability_yes": 0.3}
+        else:
+            k = len(question["options"])
+            payload = {"question": question["id"],
+                       "probability_yes_per_category": {o: 1.0 / k for o in question["options"]}}
+        return fc.Forecast(question["id"], post["id"], question["type"], payload,
+                           "Reasoning. " * 30 + "Forecast: x", "x", models_used=["gemini/x"])
+
+    monkeypatch.setenv("BOT_AUDIT", "off")
+    monkeypatch.setattr(runner, "MetaculusClient", FakeMetaculus)
+    monkeypatch.setattr(runner, "resolve_models", lambda n: ["gemini/x"])
+    monkeypatch.setattr(runner, "probe", lambda models: {})
+    monkeypatch.setattr(runner, "catalogue_report", lambda: [])
+    monkeypatch.setattr(runner, "forecast_question", forecast_question)
+    monkeypatch.setattr(runner.time, "sleep", lambda s: None)
+    monkeypatch.setattr(config, "DRY_RUN_PATIENCE_SECONDS", 600)
+    runner.main(["--mode", "test", "--dry-run"])
+    assert calls == [101, 105, 105] or sorted(calls) == [101, 105, 105], calls
+    assert runner.TALLY.duplicates == []
+    assert not runner.TALLY.waiting

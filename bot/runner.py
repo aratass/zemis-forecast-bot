@@ -47,6 +47,7 @@ from .llm import (
     LLMError,
     NoModelsAvailable,
     catalogue_report,
+    failure_summary,
     metaculus_proxy_models,
     probe,
     provider_is_metered,
@@ -106,7 +107,10 @@ def _seen_before(client: MetaculusClient, post: dict, question: dict) -> bool:
 
 
 def collect_targets(
-    client: MetaculusClient, tournaments: list[str], include_forecast: bool = False
+    client: MetaculusClient,
+    tournaments: list[str],
+    include_forecast: bool = False,
+    skip: set | None = None,
 ) -> list[tuple[dict, dict]]:
     """Open questions in these tournaments that the bot has not forecast yet.
 
@@ -128,7 +132,7 @@ def collect_targets(
             for question in sub_questions(post):
                 qid = question.get("id")
                 qtype = question.get("type")
-                if not qid or qid in seen:
+                if not qid or qid in seen or (skip and qid in skip):
                     continue
                 seen.add(qid)
                 if qtype not in SUPPORTED:
@@ -279,7 +283,10 @@ def run_tick(
     include_forecast: bool = False,
     diverse: bool = False,
 ) -> int:
-    targets = collect_targets(client, tournaments, include_forecast=include_forecast)
+    # A dry run submits nothing, so the server cannot tell it what this
+    # process already did; the tally can.
+    done_here = TALLY.forecast_ids() if client.dry_run else None
+    targets = collect_targets(client, tournaments, include_forecast=include_forecast, skip=done_here)
     if not targets:
         log.info("nothing new to forecast")
         return 0
@@ -360,6 +367,15 @@ def check_sources() -> int:
     # Guessing a name the proxy does not serve costs a whole run, so ask it.
     proxy = metaculus_proxy_models()
     print(json.dumps({"metaculus_proxy_models": proxy or "none listed"}, indent=2))
+
+    # The same run can read the bot's own record at no model cost.
+    source_lines = [f"{name}: {n} item(s)" for name, n in sorted(by_source.items())] or ["no source answered"]
+    source_lines += [f"error: {e[:160]}" for e in found.errors[:6]]
+    report.annotate("notice", "research sources", "\n".join(source_lines))
+    try:
+        _self_audit(MetaculusClient(dry_run=True))
+    except MetaculusError as exc:
+        log.error("%s", exc)
     return 0 if by_source else 1
 
 
@@ -438,6 +454,13 @@ def main(argv: list[str] | None = None) -> int:
     report.summary("### Ensemble\n\n" + "\n".join(f"- {line}" for line in ensemble_lines))
 
     deadline = time.monotonic() + args.watch if args.watch else None
+    interval = args.interval
+    if args.dry_run and not args.watch and config.DRY_RUN_PATIENCE_SECONDS > 0:
+        # A single pass sees a question wait and then stops, which tests the
+        # waiting but never the forecast. So a dry run polls like a watcher
+        # for a while, until nothing waits, and never more than the patience.
+        deadline = time.monotonic() + config.DRY_RUN_PATIENCE_SECONDS
+        interval = config.DRY_RUN_INTERVAL_SECONDS
     total = 0
     while True:
         started = time.monotonic()
@@ -458,15 +481,20 @@ def main(argv: list[str] | None = None) -> int:
 
         if deadline is None:
             break
+        if args.dry_run and not args.watch and not TALLY.waiting:
+            break
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
-        nap = max(30.0, min(args.interval - (time.monotonic() - started), remaining))
+        nap = max(30.0, min(interval - (time.monotonic() - started), remaining))
         log.info("sleeping %.0fs (%.0fs left in this watch window)", nap, remaining)
         time.sleep(nap)
 
     log.info("forecast %d question(s) this run. LLM usage: %s", total, USAGE.summary())
-    tally = TALLY.lines() + [f"LLM usage: {USAGE.summary()}"]
+    tally = TALLY.lines() + [
+        f"LLM usage: {USAGE.summary()}",
+        f"failed model calls: {failure_summary()}",
+    ]
     for line in tally:
         log.info("tally: %s", line)
     troubled = bool(TALLY.with_problems or TALLY.duplicates or TALLY.comment_failures or TALLY.held_back)
@@ -481,7 +509,6 @@ def _keys_present() -> list[str]:
         "OPENROUTER_API_KEY",
         "GEMINI_API_KEY",
         "GROQ_API_KEY",
-        "GITHUB_MODELS_TOKEN",
         "ASKNEWS_CLIENT_ID",
         "ASKNEWS_SECRET",
     )

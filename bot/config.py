@@ -65,7 +65,12 @@ ENSEMBLE_ATTEMPTS = _int_env("ENSEMBLE_ATTEMPTS", 2)
 
 # A dry run only reads and reasons, but it spends the same free allowances as a
 # live run, so it looks at a handful of questions, not the whole tournament.
-DRY_RUN_LIMIT = _int_env("DRY_RUN_LIMIT", 8)
+DRY_RUN_LIMIT = _int_env("DRY_RUN_LIMIT", 6)
+
+# A dry run keeps polling while questions wait for strong answers, like a
+# watcher would, but for at most this long, and stops as soon as none wait.
+DRY_RUN_PATIENCE_SECONDS = _int_env("DRY_RUN_PATIENCE_SECONDS", 1500)
+DRY_RUN_INTERVAL_SECONDS = _int_env("DRY_RUN_INTERVAL_SECONDS", 150)
 
 # Questions are open to bots for about three hours, so a tick that takes longer
 # than a few minutes risks missing the window entirely.

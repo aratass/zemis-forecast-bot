@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import concurrent.futures as cf
 import json
+from collections import Counter
 import logging
 import os
 import re
@@ -53,10 +54,8 @@ PROVIDERS: dict[str, Provider] = {
         "gemini", "https://generativelanguage.googleapis.com/v1beta/openai", "GEMINI_API_KEY"
     ),
     "groq": Provider("groq", "https://api.groq.com/openai/v1", "GROQ_API_KEY"),
-    # GitHub Models, reached with the workflow's own GITHUB_TOKEN when the
-    # workflow grants "models: read". Free, but small: 50 requests a day on the
-    # "high" tier, at most 8,000 tokens in and 4,000 out per request.
-    "github": Provider("github", "https://models.github.ai/inference", "GITHUB_MODELS_TOKEN"),
+    # GitHub Models is not here: GitHub retired it on 30 July 2026, and its
+    # endpoint now answers every request with a bare "OK".
 }
 
 # A free OpenRouter key buys the ":free" variants and nothing else; asking it
@@ -103,7 +102,6 @@ PROVIDER_LIMITS: dict[str, tuple[float, int]] = {
     "gemini": (10.0, 2),
     "groq": (25.0, 3),
     "metaculus": (20.0, 2),
-    "github": (10.0, 2),
 }
 
 # Free OpenRouter models are limited to 20 requests a minute.
@@ -135,11 +133,10 @@ PRIMARY_MODELS = int(os.environ.get("PRIMARY_MODELS") or 4)
 PRIMARY_GEMINI_MIN_VERSION = float(os.environ.get("PRIMARY_GEMINI_MIN_VERSION") or 3.5)
 
 # Stand-ins in the order they are asked, strongest first by the same board:
-# Nemotron 3 Ultra +5.83 (OpenRouter free), GPT-4.1 +2.77 (GitHub Models),
-# GPT-OSS 120B -0.26 (Groq).
-FALLBACK_PROVIDER_ORDER = ("openrouter", "github", "groq")
+# Nemotron 3 Ultra +5.83 (OpenRouter free, when a key is present), GPT-OSS
+# 120B -0.26 (Groq).
+FALLBACK_PROVIDER_ORDER = ("openrouter", "groq")
 OPENROUTER_FREE_PREFERENCES = (r"^nvidia/nemotron-3-ultra[^:]*:free$",)
-GITHUB_MODELS_PREFERENCES = ("openai/gpt-4.1",)
 
 # Filled in by resolve_models. A model in this set is only ever asked after
 # every primary model in the same run has failed.
@@ -178,17 +175,9 @@ def _reasoning_params(prov: "Provider", limit_key: str) -> dict:
         return {}
     if limit_key in NO_REASONING:
         return {}
-    if prov.name == "github":
-        # GPT-4.1 is not a reasoning model, and the free tier caps output at
-        # 4,000 tokens, so there is no room for thinking anyway.
-        return {}
     if prov.name == "openrouter":
         return {"reasoning": {"effort": REASONING_EFFORT}}
     return {"reasoning_effort": REASONING_EFFORT}
-
-
-# GitHub Models' free tier refuses more than 4,000 output tokens per request.
-GITHUB_MAX_OUTPUT_TOKENS = 4000
 
 
 class _RateLimiter:
@@ -268,7 +257,7 @@ EXHAUSTED_UNTIL: dict[str, float] = {}
 COOLDOWN_SECONDS = 60.0
 _COOLDOWN_UNTIL: dict[str, float] = {}
 
-# GitHub Models answers an over-long prompt with a 400 or 413. That is about the
+# A provider answers an over-long prompt with a 400 or 413. That is about the
 # prompt, not the model, so it must not write the model off.
 _PROMPT_TOO_LONG = re.compile(
     r"(tokens_limit_reached|too large|too long|maximum context|context length)", re.I
@@ -327,6 +316,51 @@ def _error_brief(resp) -> str:
     if message:
         parts.append(re.sub(r"\s+", " ", str(message))[:160])
     return " | ".join(p for p in parts if p)
+
+
+# Every failed call by model and reason, for the end-of-run tally. The log
+# has the detail; this answers "which models kept failing, and why" in one line.
+FAILURES: "Counter[str]" = Counter()
+_FAILURES_LOCK = threading.Lock()
+
+
+def _count_failure(model: str, reason: str) -> None:
+    with _FAILURES_LOCK:
+        FAILURES[f"{model.split('/')[-1]} {reason}"] += 1
+
+
+def failure_summary(limit: int = 12) -> str:
+    with _FAILURES_LOCK:
+        common = FAILURES.most_common(limit)
+    return ", ".join(f"{k} x{n}" for k, n in common) or "none"
+
+
+def _short_reason(resp) -> str:
+    """A few words for the tally: status, and which limit for a 429."""
+    code = getattr(resp, "status_code", "?")
+    text = getattr(resp, "text", "") or ""
+    if code == 429:
+        kind = "daily" if _DAILY_LIMIT.search(text) else "per-minute" if re.search(r"PerMinute|per minute|RPM|TPM", text, re.I) else "rate"
+        value = re.search(r'"quotaValue"\s*:\s*"?(\d+)', text)
+        return f"429 {kind}" + (f" limit {value.group(1)}" if value else "")
+    return f"HTTP {code}"
+
+
+class Answer(str):
+    """A model's answer, carrying the provider's separate reasoning text if any.
+
+    Some providers return a reasoning model's thinking in its own field and
+    only the final block as the content: Groq's gpt-oss-120b answered with the
+    bare PERCENTILES block. Parsing must see only the content, but the comment
+    should carry the reasoning, which the rules ask to be visible.
+    """
+
+    reasoning: str = ""
+
+    def __new__(cls, text: str, reasoning: str = ""):
+        obj = super().__new__(cls, text)
+        obj.reasoning = reasoning or ""
+        return obj
 
 
 @dataclass
@@ -403,7 +437,7 @@ def _adapt_model_name(prov: Provider, model: str) -> str:
     where the slash is part of the name and removing it produces a 404. Groq
     and OpenRouter ids go out exactly as their catalogues gave them.
     """
-    if prov.name in ("openrouter", "groq", "github"):
+    if prov.name in ("openrouter", "groq"):
         return model
     return model.split("/", 1)[1] if "/" in model else model
 
@@ -440,8 +474,6 @@ def chat(
     if thinking:
         body.update(thinking)
         body["max_tokens"] = max(max_tokens, REASONING_MAX_TOKENS)
-    if prov.name == "github":
-        body["max_tokens"] = min(body["max_tokens"], GITHUB_MAX_OUTPUT_TOKENS)
 
     last = None
     for attempt in range(1, attempts + 1):
@@ -456,12 +488,14 @@ def chat(
                 )
             except requests.RequestException as exc:
                 last = f"{type(exc).__name__}: {exc}"
+                _count_failure(model, type(exc).__name__)
                 time.sleep(min(2 ** attempt, 30))
                 continue
 
         if resp.status_code == 429:
             detail = _error_brief(resp)
             delay = _retry_delay(resp)
+            _count_failure(model, _short_reason(resp))
             if _DAILY_LIMIT.search(resp.text or "") or (
                 delay is not None and delay >= LONG_RETRY_SECONDS
             ):
@@ -494,12 +528,14 @@ def chat(
         if resp.status_code in (500, 502, 503, 504):
             detail = _error_brief(resp)
             last = f"HTTP {resp.status_code} ({detail})"
+            _count_failure(model, _short_reason(resp))
             _COOLDOWN_UNTIL[model] = time.monotonic() + COOLDOWN_SECONDS
             log.info("%s %s -> HTTP %s (%s)", prov.name, bare_model, resp.status_code, detail)
             if attempt < attempts:
                 time.sleep(min(5.0 * attempt, 20.0))
             continue
         if resp.status_code in (400, 413) and _PROMPT_TOO_LONG.search(resp.text or ""):
+            _count_failure(model, "prompt too long")
             raise LLMError(
                 f"{prov.name} {bare_model}: prompt too long for this model ({_error_brief(resp)})"
             )
@@ -515,10 +551,12 @@ def chat(
                     body["max_tokens"] = max_tokens
                     continue
             DEAD_MODELS.add(model)
+            _count_failure(model, _short_reason(resp))
             raise ModelUnavailable(
                 f"{prov.name} {bare_model} -> HTTP {resp.status_code}: {resp.text[:300]}"
             )
         if not resp.ok:
+            _count_failure(model, _short_reason(resp))
             raise LLMError(f"{prov.name} {bare_model} -> HTTP {resp.status_code}: {resp.text[:400]}")
 
         try:
@@ -528,6 +566,7 @@ def chat(
             # body that was not JSON, and the exception escaped every handler
             # and ended the run. Treat it like an overload.
             last = f"HTTP {resp.status_code} with an unreadable body {(resp.text or '')[:60]!r}"
+            _count_failure(model, "unreadable body")
             _COOLDOWN_UNTIL[model] = time.monotonic() + COOLDOWN_SECONDS
             log.info("%s %s: %s", prov.name, bare_model, last)
             if attempt < attempts:
@@ -536,7 +575,8 @@ def chat(
         try:
             choice = data["choices"][0]
             text = choice["message"]["content"]
-        except (KeyError, IndexError, TypeError):
+            thought = choice["message"].get("reasoning") or choice["message"].get("reasoning_content") or ""
+        except (KeyError, IndexError, TypeError, AttributeError):
             raise LLMError(f"{prov.name} returned no content: {json.dumps(data)[:400]}")
         if (
             (body.get("reasoning") or body.get("reasoning_effort"))
@@ -561,11 +601,12 @@ def chat(
             # An empty answer parses to nothing, and returning it would end the
             # fallback chain on a run that produced no forecast. Let the next
             # model try instead.
+            _count_failure(model, "empty answer")
             raise LLMError(
                 f"{prov.name} {bare_model} returned an empty answer "
                 f"(finish_reason {choice.get('finish_reason')!r})"
             )
-        return text
+        return Answer(text, thought if isinstance(thought, str) else "")
 
     raise LLMError(f"{prov.name} {bare_model} failed after {attempts} attempts: {last}")
 
@@ -681,7 +722,7 @@ def keyed_providers() -> list[Provider]:
     model, so it only joins the ensemble when nothing else is keyed.
     """
     named = [
-        PROVIDERS[n] for n in ("openrouter", "gemini", "groq", "github") if PROVIDERS[n].key
+        PROVIDERS[n] for n in ("openrouter", "gemini", "groq") if PROVIDERS[n].key
     ]
     if named:
         return named
@@ -735,24 +776,8 @@ def catalogue_report() -> list[str]:
             key=lambda m: (-(gemini_version(m) or 0.0), m),
         )
         lines.append("gemini flash ids: " + (", ".join(m.split("/", 1)[-1] for m in flash[:12]) or "none listed"))
-    github = PROVIDERS["github"]
-    if github.key:
-        try:
-            resp = requests.get(
-                "https://models.github.ai/catalog/models",
-                headers={"Authorization": f"Bearer {github.key}", "Accept": "application/vnd.github+json"},
-                timeout=30,
-            )
-            resp.raise_for_status()
-            entries = resp.json()
-            rows = [
-                f"{e.get('id')} ({e.get('rate_limit_tier') or '?'})"
-                for e in (entries if isinstance(entries, list) else [])
-                if isinstance(e, dict) and re.match(r"^(openai|xai|deepseek|meta|mistral-ai|microsoft|cohere|ai21-labs)/", str(e.get("id") or ""))
-            ]
-            lines.append("github models: " + (", ".join(rows[:40]) or "none listed"))
-        except Exception as exc:  # noqa: BLE001 - a report must not stop a run
-            lines.append(f"github models: catalogue unreadable ({str(exc)[:120]})")
+        gemma = [m.split("/", 1)[-1] for m in provider_catalogue(gemini) if "gemma" in m.lower()]
+        lines.append("gemma ids: " + (", ".join(gemma[:12]) or "none listed"))
     if PROVIDERS["openrouter"].key:
         free = [str(e.get("id")) for e in _catalogue() if str(e.get("id") or "").endswith(":free")]
         lines.append("openrouter free ids: " + (", ".join(free[:25]) or "none listed"))
@@ -859,8 +884,6 @@ def fallback_model(prov: Provider) -> str | None:
                 if re.search(pattern, mid):
                     return f"openrouter/{mid}"
         return None
-    if prov.name == "github":
-        return f"github/{GITHUB_MODELS_PREFERENCES[0]}"
     ranked = _rank_bare(provider_catalogue(prov))
     return f"{prov.name}/{ranked[0]}" if ranked else None
 
@@ -916,8 +939,8 @@ def resolve_models(count: int = 3) -> list[str]:
         # good Groq key sat unused.
         served = {}
         for prov in keyed:
-            if prov.name in ("openrouter", "github"):
-                # Free keys here buy one specific model, not the catalogue.
+            if prov.name == "openrouter":
+                # A free key here buys one specific model, not the catalogue.
                 mid = fallback_model(prov)
                 if mid:
                     served[prov.name] = [mid.split("/", 1)[1]]

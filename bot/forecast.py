@@ -277,15 +277,38 @@ def _choose(ctx: dict, parsed: list, runs: int, deferrable: bool, notes: list[st
         raise EnsembleTooThin(
             f"{len(strong)} of {needed} strong answers so far; waiting for the next poll"
         )
-    if parsed:
+    if strong:
+        # At the deadline with fewer strong answers than wanted, the strong
+        # ones still speak alone. The gap is about thirteen points on the
+        # FutureEval model board (Gemini 3.6 Flash +13.22, GPT-OSS 120B -0.26),
+        # so a median that lets three stand-ins outvote one Flash answer is
+        # mostly the weaker model.
+        dropped = len(parsed) - len(strong)
         notes.append(
-            f"only {len(strong)} strong answer(s) before the deadline; stand-ins included"
+            f"only {len(strong)} strong answer(s) before the deadline; used alone"
+            + (f", {dropped} stand-in answer(s) left out" if dropped else "")
         )
+        return strong
+    if parsed:
+        notes.append("no strong answer before the deadline; stand-ins used")
     return parsed
 
 
+def _with_thinking(text: str) -> str:
+    """The answer plus the provider's separate reasoning, when the answer is bare.
+
+    A reasoning model served through some providers returns its thinking in a
+    separate field and only the final block as content. The comment should
+    carry the reasoning, since the rules ask for comments that show it.
+    """
+    thought = getattr(text, "reasoning", "") or ""
+    if thought and len((text or "").strip()) < 600:
+        return thought.strip() + "\n\n" + str(text).strip()
+    return str(text or "")
+
+
 def _reasoning_excerpt(text: str, limit: int = COMMENT_REASONING_CHARS) -> str:
-    text = (text or "").strip()
+    text = _with_thinking(text).strip()
     if len(text) <= limit:
         return text
     head = limit - 800

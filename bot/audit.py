@@ -22,6 +22,7 @@ from __future__ import annotations
 import logging
 from collections import Counter
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 from .cdf import DEFAULT_INBOUND_OUTCOME_COUNT, validate_cdf
@@ -56,6 +57,9 @@ class TournamentAudit:
     leaderboard_score: float | None = None
     prize: float | None = None
     errors: list[str] = field(default_factory=list)
+    # One line per problem question, saying when it happened, so a duplicate
+    # can be matched to the run that made it.
+    details: list[str] = field(default_factory=list)
 
     @property
     def clean(self) -> bool:
@@ -102,7 +106,10 @@ class TournamentAudit:
             parts.append(f"open and not yet forecast: {self.open_unforecast[:10]}")
         if self.errors:
             parts.append("audit errors: " + "; ".join(self.errors)[:300])
-        return "; ".join(parts)
+        line = "; ".join(parts)
+        if self.details:
+            line += "\n  " + "\n  ".join(self.details[:12])
+        return line
 
 
 def _forecast_count(question: dict) -> int:
@@ -112,6 +119,19 @@ def _forecast_count(question: dict) -> int:
         return len(history)
     latest = mine.get("latest") or {}
     return 1 if latest.get("forecast_values") else 0
+
+
+def _when(epoch: Any) -> str:
+    try:
+        return datetime.fromtimestamp(float(epoch), timezone.utc).strftime("%m-%d %H:%M")
+    except (TypeError, ValueError, OverflowError, OSError):
+        return "?"
+
+
+def _forecast_times(question: dict) -> str:
+    history = (question.get("my_forecasts") or {}).get("history") or []
+    times = [_when(h.get("start_time")) for h in history if isinstance(h, dict)]
+    return ", ".join(times[:8]) + (f" (+{len(times) - 8} more)" if len(times) > 8 else "")
 
 
 def _latest_values(question: dict) -> list[float] | None:
@@ -214,13 +234,20 @@ def audit_tournament(client: MetaculusClient, slug: str, me_id: int) -> Tourname
             forecast_here = True
             audit.questions_forecast += 1
             qid = question.get("id")
+            title = (question.get("title") or post.get("title") or "")[:70]
             if n > 1:
                 audit.duplicates.append(qid)
+                audit.details.append(
+                    f"q{qid} forecast {n} times, UTC {_forecast_times(question)} ({question.get('type')}, "
+                    f"post {post.get('id')}{', in a group' if post.get('group_of_questions') else ''}): {title}"
+                )
             problems = check_question(question)
             if "fifty" in problems:
                 audit.at_fifty.append(qid)
+                audit.details.append(f"q{qid} at exactly 50%, UTC {_forecast_times(question)}: {title}")
             if "malformed" in problems:
                 audit.malformed.append(qid)
+                audit.details.append(f"q{qid} malformed ({question.get('type')}): {title}")
             if question.get("status") == "open":
                 audit.questions_open += 1
             if _is_resolved(question):

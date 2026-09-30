@@ -53,6 +53,7 @@ def fresh_model_state():
         llm.EXHAUSTED_UNTIL.clear()
         llm._COOLDOWN_UNTIL.clear()
         llm.PRIMARY_PROVIDER = None
+        llm.FAILURES.clear()
         forecast._STRONG_ANSWERS.clear()
 
     clear()

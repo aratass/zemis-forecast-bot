@@ -125,6 +125,10 @@ class RunTally:
         with self._lock:
             self.held_back.append(qid)
 
+    def forecast_ids(self) -> set:
+        with self._lock:
+            return {r.question_id for r in self.forecasts}
+
     @property
     def duplicates(self) -> list[int]:
         with self._lock:

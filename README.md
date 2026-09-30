@@ -39,21 +39,23 @@ Being clever comes third.
 3. **Ensemble.** On free keys, four runs, one led by each of the newest
    Gemini Flash versions the key can see (3.5 and newer), with every run
    falling through the other Flash versions before anything else. Other free
-   models (OpenRouter's free Nemotron 3 Ultra, GitHub Models' GPT-4.1, Groq's
-   gpt-oss-120b, in that order) only stand in, and only when the question is
-   within 30 minutes of closing and fewer than two Flash answers are in. Until
-   then the question waits for the next poll and keeps the answers it has.
-   The reason is measured: Metaculus's FutureEval model leaderboard scores
-   Gemini 3.5 Flash at +12.17 and 3.6 Flash at +13.22 against GPT-4o, and
-   gpt-oss-120b at -0.26, and from 21 to 30 September 63 of the 68 answers
-   behind this bot's tournament forecasts came from gpt-oss-120b because the
-   single Gemini member kept answering 429 or 503. With sponsored credits the
-   old design applies: runs across three model families. The prompt asks for
-   the status quo outcome, an explicit base rate and reference class, what the
-   evidence establishes, the case each way, and how much can change in the
-   time left. It does not use multi-persona or "think like a Bayesian"
-   framing, both of which measured worse than plain reasoning in published
-   evaluations.
+   models (OpenRouter's free Nemotron 3 Ultra when a key is present, then
+   Groq's gpt-oss-120b) only stand in, and only when the question is within
+   30 minutes of closing and fewer than two Flash answers are in. Until then
+   the question waits for the next poll and keeps the answers it has. At the
+   deadline any Flash answers speak alone; stand-ins are used only when no
+   Flash model answered at all. The reason is measured: Metaculus's
+   FutureEval model leaderboard scores Gemini 3.5 Flash at +12.17 and 3.6
+   Flash at +13.22 against GPT-4o, and gpt-oss-120b at -0.26, and in the
+   Summer 2026 bot tournament Metaculus's own simple Gemini 3.5 Flash bot
+   finished with +2,533 points (26th of 192 bots, in the paid zone) while its
+   GPT-4o bot finished with -2,565 (178th). The free tier gives each Flash
+   version 20 requests a day. With sponsored credits the old design applies:
+   runs across three model families. The prompt asks for the status quo
+   outcome, an explicit base rate and reference class, what the evidence
+   establishes, the case each way, and how much can change in the time left.
+   It does not use multi-persona or "think like a Bayesian" framing, both of
+   which measured worse than plain reasoning in published evaluations.
 4. **Aggregate.** Median, not mean, so one hallucinated number cannot move the
    answer. Numeric questions take the median percentile by percentile. When
    there are enough Flash answers, stand-in answers are left out of the median
@@ -124,8 +126,7 @@ things if present:
 | `GROQ_API_KEY` | gpt-oss-120b, the last stand-in |
 | `ASKNEWS_CLIENT_ID`, `ASKNEWS_SECRET` | news search via the Metaculus partnership |
 
-GitHub Models' GPT-4.1 stand-in needs no secret: the workflow passes its own
-`GITHUB_TOKEN` as `GITHUB_MODELS_TOKEN` when it grants `models: read`.
+GitHub Models is not used: GitHub retired it on 30 July 2026.
 
 No secret is ever logged; the client scrubs the token out of exception text
 before printing it.
