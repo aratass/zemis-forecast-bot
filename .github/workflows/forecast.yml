@@ -1,21 +1,16 @@
 name: forecast
 
-# GitHub's cron does not work for this repository. Over the first two days it
-# fired twice against a schedule asking every fifteen minutes, and after the
-# workflow was disabled and re-enabled it stopped firing for over an hour.
-# Questions are open to bots for about three hours, and a question never
-# forecast scores the same as one forecast badly, so coverage cannot depend on
-# it.
-#
-# So a watcher no longer does one pass and exit. It polls inside a single job
-# for five and a half hours, and on the way out it starts its replacement. The
-# cron below stays only as a safety net for when the chain breaks. The
-# concurrency group means one watcher at a time: a firing that arrives while
-# one is running waits its turn rather than doubling up. Manual runs without
-# the watch box ticked still do a single pass.
+# One pass per run on a plain schedule, the way Metaculus's own bot template
+# runs. Until 2 Oct 2026 this workflow chained five and a half hour watcher
+# jobs so a runner was busy around the clock. That is not what GitHub-hosted
+# runners are for (their terms cover building, testing and deploying a
+# project), and the same account hosts other projects, so the chain is gone.
+# GitHub's scheduler has been unreliable for this repository, so some
+# questions may be missed. That is accepted: the bot is a lottery ticket, not
+# an income line.
 on:
   schedule:
-    - cron: "7 * * * *"
+    - cron: "*/30 * * * *"
   workflow_dispatch:
     inputs:
       mode:
@@ -28,7 +23,7 @@ on:
         type: boolean
         default: false
       watch:
-        description: keep polling for five and a half hours instead of one pass
+        description: ignored since 2 Oct 2026, every run is one pass (kept so an older watcher can still hand over without an error)
         type: boolean
         default: false
 
@@ -46,10 +41,7 @@ permissions:
 jobs:
   forecast:
     runs-on: ubuntu-latest
-    # A job is killed at six hours. The watch window is deliberately shorter,
-    # so the process exits on its own terms: a job killed by the timeout counts
-    # as cancelled, and the handover step below does not run on cancellation.
-    timeout-minutes: 345
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -57,28 +49,6 @@ jobs:
           python-version: "3.11"
           cache: pip
       - run: pip install -r requirements.txt
-      - name: note when this watcher started
-        run: echo "WATCH_STARTED=$(date +%s)" >> "$GITHUB_ENV"
-      - name: check the handover token before spending five hours
-        # The handover runs at the far end of the window. A broken or missing
-        # WATCHER_PAT would therefore announce itself five and a half hours
-        # after the mistake, by which point coverage has already stopped. One
-        # API call at the start turns that into a warning in the first minute.
-        if: ${{ github.event_name == 'schedule' || inputs.watch }}
-        env:
-          GH_TOKEN: ${{ secrets.WATCHER_PAT }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          set -uo pipefail
-          if [ -z "${GH_TOKEN}" ]; then
-            echo "::warning::WATCHER_PAT is empty. This watcher will run, but nothing will start the next one."
-            exit 0
-          fi
-          if gh run list --workflow forecast.yml --limit 1 >/dev/null 2>&1; then
-            echo "handover token works; this watcher can start its replacement"
-          else
-            echo "::warning::WATCHER_PAT is set but cannot read this repository's runs. It probably needs Actions: read and write."
-          fi
       - name: self-audit
         # The bot's record and the models this watcher will use, as
         # annotations. Its own step so that a failure here can never stop the
@@ -114,38 +84,4 @@ jobs:
         run: |
           python -m bot.runner \
             --mode "${{ inputs.mode || 'tournament' }}" \
-            ${{ (github.event_name == 'schedule' || inputs.watch) && '--watch 19800 --interval 240' || '' }} \
             ${{ inputs.dry_run && '--dry-run' || '' }}
-      - name: hand over to the next watcher
-        # Only a watcher hands over, never a one-off manual pass.
-        #
-        # success() || failure() rather than always(): a cancelled run was
-        # stopped by a person, and restarting it would be arguing with them.
-        if: ${{ (success() || failure()) && (github.event_name == 'schedule' || inputs.watch) }}
-        env:
-          GH_TOKEN: ${{ secrets.WATCHER_PAT }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          set -uo pipefail
-          if [ -z "${GH_TOKEN}" ]; then
-            echo "::warning::WATCHER_PAT is not set, so this watcher cannot start the next one. Coverage stops here."
-            exit 0
-          fi
-          elapsed=$(( $(date +%s) - ${WATCH_STARTED:-0} ))
-          echo "this watcher ran for ${elapsed}s"
-          # A watcher that dies in minutes is broken, and chaining it would
-          # spend the whole Actions allowance rediscovering that every few
-          # minutes. Stop, and let the hourly cron or a person restart it.
-          if [ "${elapsed}" -lt 1200 ]; then
-            echo "::warning::only ${elapsed}s before exiting, so not chaining. Fix the failure and start one by hand."
-            exit 0
-          fi
-          since=$(date -u -d '2 hours ago' +%Y-%m-%dT%H:%M:%SZ)
-          recent=$(gh run list --workflow forecast.yml --limit 40 \
-            --json createdAt --jq "[.[] | select(.createdAt > \"${since}\")] | length")
-          if [ "${recent:-0}" -gt 4 ]; then
-            echo "::warning::${recent} runs since ${since}, so not chaining."
-            exit 0
-          fi
-          gh workflow run forecast.yml --ref "${GITHUB_REF_NAME}" -f mode=tournament -f watch=true
-          echo "next watcher requested"

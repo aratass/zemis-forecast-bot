@@ -121,6 +121,9 @@ python -m bot.runner --mode tournament        # live
 `--watch SECONDS` keeps one process polling, for continuous coverage from a
 single job.
 
+The GitHub workflow does not use it: since 2 Oct 2026 it runs one pass every
+30 minutes, like Metaculus's own template.
+
 ## Secrets
 
 Only `METACULUS_TOKEN` is required. It authenticates the API and, as a
